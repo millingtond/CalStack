@@ -10,6 +10,7 @@ import {
   signInWithGoogle, signInWithApple,
   signInWithEmail, createEmailAccount,
   sendMagicLink, completeMagicLinkSignIn,
+  handleRedirectResult,
   signOutUser,
 } from './firebase';
 import {
@@ -953,8 +954,20 @@ export default function App() {
       try {
         const uid = await waitForAuth();
         setCurrentUser(auth.currentUser);
-        // Complete magic link sign-in if the URL contains one
         let activeUid = uid;
+
+        // Handle return from Google/Apple redirect sign-in (mobile/PWA)
+        try {
+          const redirectUser = await handleRedirectResult();
+          if (redirectUser) {
+            setCurrentUser(redirectUser);
+            activeUid = redirectUser.uid;
+          }
+        } catch (e) {
+          console.warn('Redirect sign-in failed:', e);
+        }
+
+        // Complete magic link sign-in if the URL contains one
         try {
           const magicUser = await completeMagicLinkSignIn();
           if (magicUser) {
@@ -964,6 +977,7 @@ export default function App() {
         } catch (e) {
           console.warn('Magic link sign-in failed:', e);
         }
+
         await loadUserData(activeUid);
       } catch (e) {
         console.error('Init error:', e);

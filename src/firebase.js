@@ -11,6 +11,9 @@ import {
   signInWithEmailAndPassword,
   linkWithPopup,
   signInWithPopup,
+  linkWithRedirect,
+  signInWithRedirect,
+  getRedirectResult,
   linkWithCredential,
   signInWithCredential,
   sendSignInLinkToEmail,
@@ -34,10 +37,21 @@ export const db = getFirestore(app);
 export const auth = getAuth(app);
 
 /**
+ * True on Android/iOS devices and when running as an installed PWA.
+ * In these environments Chrome blocks popups, so we must use redirect.
+ */
+function isMobile() {
+  return (
+    /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    window.matchMedia('(display-mode: standalone)').matches ||
+    !!window.navigator.standalone
+  );
+}
+
+/**
  * Wait for anonymous auth to resolve.
- * Returns the uid. If the user has previously visited,
- * Firebase restores the same anonymous uid automatically,
- * so all their data persists across sessions.
+ * Returns the uid. Firebase restores the same anonymous uid on revisit
+ * so all data persists across sessions on the same device.
  */
 export function waitForAuth() {
   return new Promise((resolve, reject) => {
@@ -58,82 +72,91 @@ export function waitForAuth() {
 }
 
 /**
- * Link anonymous account to Google, or sign in with Google if already linked.
- * Preserves all existing data when linking for the first time.
- * NOTE: Enable Google Sign-In in Firebase Console → Authentication → Sign-in methods.
+ * On mobile/PWA: redirects to Google (page reloads on return).
+ * On desktop: opens a popup.
+ * Either way, returns the signed-in user — or null if a redirect was initiated
+ * (in which case handleRedirectResult() will complete the sign-in on next load).
  */
 export async function signInWithGoogle() {
-  const provider = new GoogleAuthProvider();
-  const user = auth.currentUser;
-  if (user?.isAnonymous) {
-    try {
-      const result = await linkWithPopup(user, provider);
-      return result.user;
-    } catch (err) {
-      if (err.code === 'auth/credential-already-in-use') {
-        // Google account already has its own Firebase account — sign in to it instead
-        const result = await signInWithCredential(auth, err.credential);
-        return result.user;
-      }
-      throw err;
-    }
-  } else {
-    const result = await signInWithPopup(auth, provider);
-    return result.user;
-  }
+  return _signInWithProvider(new GoogleAuthProvider());
 }
 
 /**
- * Link anonymous account to Apple, or sign in with Apple.
- * NOTE: Requires Apple Developer account + Services ID. Enable Apple Sign-In
- * in Firebase Console → Authentication → Sign-in methods, and configure
- * your Apple Services ID, Team ID, Key ID, and private key.
+ * Apple sign-in — same popup/redirect logic as Google.
+ * NOTE: requires Apple Developer account + Services ID configured in Firebase Console.
  */
 export async function signInWithApple() {
   const provider = new OAuthProvider('apple.com');
   provider.addScope('email');
   provider.addScope('name');
+  return _signInWithProvider(provider);
+}
+
+async function _signInWithProvider(provider) {
   const user = auth.currentUser;
+  if (isMobile()) {
+    // Redirect flow — page navigates away; handleRedirectResult() completes sign-in on return
+    if (user?.isAnonymous) {
+      await linkWithRedirect(user, provider);
+    } else {
+      await signInWithRedirect(auth, provider);
+    }
+    return null; // page is navigating, nothing more to do here
+  }
+
+  // Popup flow (desktop)
   if (user?.isAnonymous) {
     try {
-      const result = await linkWithPopup(user, provider);
-      return result.user;
+      return (await linkWithPopup(user, provider)).user;
     } catch (err) {
       if (err.code === 'auth/credential-already-in-use') {
-        const result = await signInWithCredential(auth, err.credential);
-        return result.user;
+        return (await signInWithCredential(auth, err.credential)).user;
       }
       throw err;
     }
-  } else {
-    const result = await signInWithPopup(auth, provider);
-    return result.user;
+  }
+  return (await signInWithPopup(auth, provider)).user;
+}
+
+/**
+ * Call once on app startup (in the init useEffect).
+ * Handles the return from a Google/Apple redirect sign-in.
+ * Returns the signed-in user, or null if no redirect was pending.
+ */
+export async function handleRedirectResult() {
+  try {
+    const result = await getRedirectResult(auth);
+    return result?.user ?? null;
+  } catch (err) {
+    if (err.code === 'auth/credential-already-in-use') {
+      // The Google/Apple account already has a Firebase account — sign into it
+      return (await signInWithCredential(auth, err.credential)).user;
+    }
+    if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
+      return null; // User cancelled — treat as no-op
+    }
+    throw err;
   }
 }
 
 /**
  * Sign in with email + password.
  * Links anonymous account if this is the first sign-in on this device.
- * NOTE: Enable Email/Password in Firebase Console → Authentication → Sign-in methods.
  */
 export async function signInWithEmail(email, password) {
   const user = auth.currentUser;
   if (user?.isAnonymous) {
     const credential = EmailAuthProvider.credential(email, password);
     try {
-      const result = await linkWithCredential(user, credential);
-      return result.user;
+      return (await linkWithCredential(user, credential)).user;
     } catch (err) {
       if (err.code === 'auth/credential-already-in-use' || err.code === 'auth/email-already-in-use') {
-        const result = await signInWithEmailAndPassword(auth, email, password);
-        return result.user;
+        return (await signInWithEmailAndPassword(auth, email, password)).user;
       }
       throw err;
     }
-  } else {
-    const result = await signInWithEmailAndPassword(auth, email, password);
-    return result.user;
   }
+  return (await signInWithEmailAndPassword(auth, email, password)).user;
 }
 
 /**
@@ -144,20 +167,15 @@ export async function createEmailAccount(email, password) {
   const user = auth.currentUser;
   if (user?.isAnonymous) {
     const credential = EmailAuthProvider.credential(email, password);
-    const result = await linkWithCredential(user, credential);
-    return result.user;
-  } else {
-    const result = await createUserWithEmailAndPassword(auth, email, password);
-    return result.user;
+    return (await linkWithCredential(user, credential)).user;
   }
+  return (await createUserWithEmailAndPassword(auth, email, password)).user;
 }
 
 /**
  * Send a magic (passwordless) sign-in link to the given email.
- * Saves the email in localStorage so we can complete sign-in when the link is clicked.
- * NOTE: Enable Email link (passwordless) in Firebase Console → Authentication →
- * Sign-in methods → Email/Password → Enable "Email link (passwordless sign-in)".
- * Also add your domain to the Authorized Domains list.
+ * NOTE: Enable "Email link (passwordless sign-in)" in Firebase Console →
+ * Authentication → Sign-in methods → Email/Password.
  */
 export async function sendMagicLink(email) {
   const actionCodeSettings = {
@@ -169,9 +187,8 @@ export async function sendMagicLink(email) {
 }
 
 /**
- * Complete magic link sign-in when the user opens the link in their email.
- * Call this on app start; it's a no-op if the current URL is not a magic link.
- * Returns the signed-in user, or null if the URL is not a magic link.
+ * Complete magic link sign-in when the user opens the link.
+ * Call on app start — no-op if the URL is not a magic link.
  */
 export async function completeMagicLinkSignIn() {
   if (!isSignInWithEmailLink(auth, window.location.href)) return null;
@@ -195,12 +212,11 @@ export async function completeMagicLinkSignIn() {
       }
       throw err;
     }
-  } else {
-    const result = await signInWithEmailLink(auth, email, window.location.href);
-    localStorage.removeItem('emailForSignIn');
-    window.history.replaceState({}, document.title, window.location.pathname);
-    return result.user;
   }
+  const result = await signInWithEmailLink(auth, email, window.location.href);
+  localStorage.removeItem('emailForSignIn');
+  window.history.replaceState({}, document.title, window.location.pathname);
+  return result.user;
 }
 
 /** Sign out the current user */
