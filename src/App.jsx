@@ -536,12 +536,13 @@ function SavedMealsModal({ savedMeals, onLoad, onDelete, onClose }) {
 
 /* ─── Onboarding ─────────────────────────────────────────────────────────── */
 
-function Onboarding({ onComplete }) {
+function Onboarding({ onComplete, onSignIn }) {
   const [step, setStep] = useState(0);
   const [profile, setProfile] = useState({
     name: '', gender: 'male', age: 30, heightCm: 175, weightKg: 80,
     activityLevel: 1.375, weeklyGoalOffset: -500,
   });
+  const [showSignIn, setShowSignIn] = useState(false);
 
   const update = (k, v) => setProfile(p => ({ ...p, [k]: v }));
   const tdee = calcTDEE(profile);
@@ -554,6 +555,14 @@ function Onboarding({ onComplete }) {
 
   const steps = [
     <div key="0">
+      <button onClick={() => setShowSignIn(true)} style={{
+        width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        backgroundColor: '#fff7ed', borderRadius: 14, padding: '12px 16px', marginBottom: 28,
+        border: '1.5px solid #fed7aa', cursor: 'pointer',
+      }}>
+        <span style={{ fontSize: 14, color: '#92400e', fontWeight: 500 }}>Already have an account?</span>
+        <span style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>Sign In →</span>
+      </button>
       <div style={{ fontSize: 48, marginBottom: 16 }}>🔥</div>
       <h1 style={{ fontSize: 28, fontWeight: 800, color: '#1e293b', marginBottom: 8 }}>Let's set up your tracker</h1>
       <p style={{ fontSize: 15, color: '#94a3b8', marginBottom: 32, lineHeight: 1.5 }}>
@@ -662,6 +671,13 @@ function Onboarding({ onComplete }) {
           backgroundColor: canNext ? '#f97316' : '#d1d5db', boxShadow: canNext ? '0 4px 14px rgba(249,115,22,0.3)' : 'none',
         }}>{step < steps.length - 1 ? 'Continue' : 'Start Tracking'}</button>
       </div>
+      {showSignIn && (
+        <AuthModal
+          currentUser={null}
+          onSuccess={(user) => { setShowSignIn(false); onSignIn(user); }}
+          onClose={() => setShowSignIn(false)}
+        />
+      )}
     </div>
   );
 }
@@ -938,13 +954,17 @@ export default function App() {
         const uid = await waitForAuth();
         setCurrentUser(auth.currentUser);
         // Complete magic link sign-in if the URL contains one
+        let activeUid = uid;
         try {
           const magicUser = await completeMagicLinkSignIn();
-          if (magicUser) setCurrentUser(magicUser);
+          if (magicUser) {
+            setCurrentUser(magicUser);
+            activeUid = magicUser.uid;
+          }
         } catch (e) {
           console.warn('Magic link sign-in failed:', e);
         }
-        await loadUserData(auth.currentUser?.uid || uid);
+        await loadUserData(activeUid);
       } catch (e) {
         console.error('Init error:', e);
       }
@@ -975,7 +995,7 @@ export default function App() {
   };
 
   const addFoodEntry = async (entry) => {
-    const newLog = { ...dayLog, [entry.meal]: [...dayLog[entry.meal], entry] };
+    const newLog = { ...dayLog, [entry.meal]: [...(dayLog[entry.meal] || []), entry] };
     await saveDayLog(newLog);
     if (entry.brand !== 'Quick add' && entry.caloriesPer100) {
       const { id, name, brand, caloriesPer100, proteinPer100, carbsPer100, fatPer100 } = entry;
@@ -1023,7 +1043,7 @@ export default function App() {
     const yLog = await load(`log-${yesterday}`, null);
     if (!yLog || !yLog[meal] || yLog[meal].length === 0) return;
     const copied = yLog[meal].map(e => ({ ...e, timestamp: Date.now() }));
-    await saveDayLog({ ...dayLog, [meal]: [...dayLog[meal], ...copied] });
+    await saveDayLog({ ...dayLog, [meal]: [...(dayLog[meal] || []), ...copied] });
   };
 
   // ── Barcode lookup ──
@@ -1147,7 +1167,7 @@ export default function App() {
 
   // ── Calculations ──
   const totals = MEALS.reduce((acc, meal) => {
-    dayLog[meal].forEach(e => {
+    (dayLog[meal] || []).forEach(e => {
       acc.calories += e.calories || 0; acc.protein += e.protein || 0;
       acc.carbs += e.carbs || 0; acc.fat += e.fat || 0;
       acc.fibre += e.fibre || 0; acc.sugar += e.sugar || 0;
@@ -1216,8 +1236,12 @@ export default function App() {
     if (!confirm('This will delete ALL your data. Are you sure?')) return;
     await clearAll();
     setProfile(null);
-    setDayLog({ breakfast: [], lunch: [], dinner: [], snacks: [] });
+    setDayLog({ breakfast: [], lunch: [], dinner: [], snacks: [], water: 0, exercises: [] });
     setWeightHistory([]);
+    setCalorieSummary({});
+    setRecentFoods([]);
+    setCustomFoods([]);
+    setSavedMeals([]);
     setScreen('dashboard');
   };
 
@@ -1225,10 +1249,6 @@ export default function App() {
   const handleAuthSuccess = async (user) => {
     setCurrentUser(user);
     setShowAuthModal(false);
-    // If the UID changed (credential-already-in-use path), reload data for the new account
-    if (user.uid !== auth.currentUser?.uid) {
-      setUid(user.uid);
-    }
     await loadUserData(user.uid);
   };
 
@@ -1258,7 +1278,7 @@ export default function App() {
     );
   }
 
-  if (!profile) return <Onboarding onComplete={p => { setProfile(p); setScreen('dashboard'); }} />;
+  if (!profile) return <Onboarding onComplete={p => { setProfile(p); setScreen('dashboard'); }} onSignIn={handleAuthSuccess} />;
 
   const navItems = [
     { id: 'dashboard', icon: '◉', label: 'Today' },
@@ -1373,7 +1393,7 @@ export default function App() {
             {/* Meal summary */}
             <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', marginBottom: 16 }}>
               {MEALS.map(meal => {
-                const mealCal = dayLog[meal].reduce((s, e) => s + (e.calories || 0), 0);
+                const mealCal = (dayLog[meal] || []).reduce((s, e) => s + (e.calories || 0), 0);
                 return (
                   <div key={meal} onClick={() => { setSearchMeal(meal); setScreen('search'); }}
                     className="flex items-center justify-between"
@@ -1382,7 +1402,7 @@ export default function App() {
                       <span style={{ fontSize: 22 }}>{MEAL_ICONS[meal]}</span>
                       <div>
                         <div style={{ fontSize: 15, fontWeight: 600, color: '#1e293b' }}>{MEAL_LABELS[meal]}</div>
-                        <div style={{ fontSize: 12, color: '#94a3b8' }}>{dayLog[meal].length} item{dayLog[meal].length !== 1 ? 's' : ''}</div>
+                        <div style={{ fontSize: 12, color: '#94a3b8' }}>{(dayLog[meal] || []).length} item{(dayLog[meal] || []).length !== 1 ? 's' : ''}</div>
                       </div>
                     </div>
                     <div className="flex items-center gap-3">
@@ -1439,7 +1459,7 @@ export default function App() {
                     <span style={{ fontSize: 16, fontWeight: 700, color: '#1e293b' }}>{MEAL_LABELS[meal]}</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>{dayLog[meal].reduce((s, e) => s + (e.calories || 0), 0)} kcal</span>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>{(dayLog[meal] || []).reduce((s, e) => s + (e.calories || 0), 0)} kcal</span>
                     <button onClick={() => copyFromYesterday(meal)} title="Copy from yesterday" style={{
                       width: 28, height: 28, borderRadius: 8, border: '1.5px solid #e2e8f0', backgroundColor: '#fff',
                       cursor: 'pointer', fontSize: 13, color: '#94a3b8', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1448,7 +1468,7 @@ export default function App() {
                       width: 28, height: 28, borderRadius: 8, border: '1.5px solid #e2e8f0', backgroundColor: '#fff',
                       cursor: 'pointer', fontSize: 13, color: '#8b5cf6', display: 'flex', alignItems: 'center', justifyContent: 'center',
                     }}>★</button>
-                    {dayLog[meal].length > 0 && (
+                    {(dayLog[meal] || []).length > 0 && (
                       <button onClick={() => setSaveMealTarget({ meal, label: MEAL_LABELS[meal] })} title="Save as template" style={{
                         width: 28, height: 28, borderRadius: 8, border: '1.5px solid #e2e8f0', backgroundColor: '#fff',
                         cursor: 'pointer', fontSize: 11, color: '#94a3b8', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1460,9 +1480,9 @@ export default function App() {
                     }}>+</button>
                   </div>
                 </div>
-                {dayLog[meal].length === 0 ? (
+                {(dayLog[meal] || []).length === 0 ? (
                   <div style={{ padding: '12px 0', fontSize: 13, color: '#cbd5e1', textAlign: 'center' }}>No entries yet — tap + to add food</div>
-                ) : dayLog[meal].map((entry, idx) => (
+                ) : (dayLog[meal] || []).map((entry, idx) => (
                   <div key={idx} className="flex items-center justify-between" style={{ padding: '10px 0', borderTop: idx > 0 ? '1px solid rgba(0,0,0,0.04)' : 'none' }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 14, fontWeight: 600, color: '#1e293b', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{entry.name}</div>
