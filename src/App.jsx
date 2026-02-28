@@ -362,6 +362,8 @@ export default function App() {
   const [portionFood, setPortionFood] = useState(null);
   const [quickAddMeal, setQuickAddMeal] = useState(null);
   const searchTimer = useRef(null);
+  const searchAbort = useRef(null);
+  const searchCache = useRef({});
   const [recentFoods, setRecentFoods] = useState([]);
 
   const [newWeight, setNewWeight] = useState('');
@@ -423,17 +425,32 @@ export default function App() {
   // ── Food search via Open Food Facts ──
   const searchFood = useCallback(async (query) => {
     if (!query.trim() || query.length < 2) { setSearchResults([]); return; }
+
+    // Return cached result instantly
+    if (searchCache.current[query]) {
+      setSearchResults(searchCache.current[query]);
+      return;
+    }
+
+    // Cancel any in-flight request
+    if (searchAbort.current) searchAbort.current.abort();
+    const controller = new AbortController();
+    searchAbort.current = controller;
+
     setSearching(true);
     try {
       const res = await fetch(
-        `https://uk.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&json=1&page_size=20&fields=code,product_name,brands,nutriments,image_small_url`
+        `https://uk.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&json=1&page_size=20&fields=code,product_name,brands,nutriments,image_small_url`,
+        { signal: controller.signal }
       );
       const data = await res.json();
-      setSearchResults(
-        (data.products || []).filter(p => p.product_name && p.nutriments && (p.nutriments['energy-kcal_100g'] || p.nutriments['energy-kcal']))
+      const results = (data.products || []).filter(
+        p => p.product_name && p.nutriments && (p.nutriments['energy-kcal_100g'] || p.nutriments['energy-kcal'])
       );
-    } catch {
-      setSearchResults([]);
+      searchCache.current[query] = results;
+      setSearchResults(results);
+    } catch (e) {
+      if (e.name !== 'AbortError') setSearchResults([]);
     }
     setSearching(false);
   }, []);
@@ -441,7 +458,7 @@ export default function App() {
   const handleSearchInput = (val) => {
     setSearchQuery(val);
     clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => searchFood(val), 500);
+    searchTimer.current = setTimeout(() => searchFood(val), 300);
   };
 
   // ── Calculations ──
