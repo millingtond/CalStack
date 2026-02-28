@@ -1,5 +1,10 @@
-import { initializeApp } from 'firebase/app';
-import { getFirestore } from 'firebase/firestore';
+import { getApp, getApps, initializeApp } from 'firebase/app';
+import {
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+} from 'firebase/firestore';
 import {
   getAuth,
   signInAnonymously,
@@ -32,19 +37,30 @@ const firebaseConfig = {
   measurementId: "G-GFYZXZ4XC8",
 };
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app);
+const existingApp = getApps().length ? getApp() : null;
+const app = existingApp ?? initializeApp(firebaseConfig);
+export const db = existingApp
+  ? getFirestore(app)
+  : initializeFirestore(app, {
+      localCache: persistentLocalCache({
+        tabManager: persistentMultipleTabManager(),
+      }),
+    });
 export const auth = getAuth(app);
 
 /**
- * True on Android/iOS devices and when running as an installed PWA.
- * In these environments Chrome blocks popups, so we must use redirect.
+ * Redirect auth avoids popup blockers on mobile/PWA and avoids COOP popup
+ * warnings on deployed static hosts that do not set popup-friendly headers.
  */
-function isMobile() {
+function shouldUseRedirectAuth() {
+  const hostname = window.location.hostname;
+  const isLocalDev = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+
   return (
     /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
     window.matchMedia('(display-mode: standalone)').matches ||
-    !!window.navigator.standalone
+    !!window.navigator.standalone ||
+    !isLocalDev
   );
 }
 
@@ -72,10 +88,8 @@ export function waitForAuth() {
 }
 
 /**
- * On mobile/PWA: redirects to Google (page reloads on return).
- * On desktop: opens a popup.
- * Either way, returns the signed-in user — or null if a redirect was initiated
- * (in which case handleRedirectResult() will complete the sign-in on next load).
+ * Uses redirect auth in production/mobile and only keeps popup auth for local
+ * desktop development. Returns null when a redirect has just been initiated.
  */
 export async function signInWithGoogle() {
   return _signInWithProvider(new GoogleAuthProvider());
@@ -94,7 +108,7 @@ export async function signInWithApple() {
 
 async function _signInWithProvider(provider) {
   const user = auth.currentUser;
-  if (isMobile()) {
+  if (shouldUseRedirectAuth()) {
     // Redirect flow — page navigates away; handleRedirectResult() completes sign-in on return
     if (user?.isAnonymous) {
       await linkWithRedirect(user, provider);

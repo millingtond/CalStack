@@ -5,8 +5,8 @@ import { VitePWA } from 'vite-plugin-pwa';
 export default defineConfig({
   server: {
     headers: {
-      // Required for Firebase popup auth (Google/Apple sign-in) to work.
-      // 'same-origin-allow-popups' lets OAuth popups communicate back to the opener.
+      // Dev-only header so popup auth still works when testing locally.
+      // Production hosting must set this separately if popup auth is used there.
       'Cross-Origin-Opener-Policy': 'same-origin-allow-popups',
     },
   },
@@ -18,7 +18,7 @@ export default defineConfig({
       manifest: {
         name: 'Calorie Tracker',
         short_name: 'Calories',
-        description: 'Track your calories and macros — no sign-up required',
+        description: 'Track your calories and macros - no sign-up required',
         theme_color: '#f97316',
         background_color: '#fafaf9',
         display: 'standalone',
@@ -65,7 +65,7 @@ export default defineConfig({
             },
           },
           {
-            // Cache Open Food Facts search results for 24h
+            // Cache Open Food Facts search results for 24h.
             urlPattern: /^https:\/\/.*openfoodfacts\.org\/.*/i,
             handler: 'NetworkFirst',
             options: {
@@ -73,17 +73,6 @@ export default defineConfig({
               expiration: { maxEntries: 100, maxAgeSeconds: 60 * 60 * 24 },
               cacheableResponse: { statuses: [0, 200] },
               networkTimeoutSeconds: 5,
-            },
-          },
-          {
-            // Firebase — network first, fall back to cache so app loads offline
-            urlPattern: /^https:\/\/firestore\.googleapis\.com\/.*/i,
-            handler: 'NetworkFirst',
-            options: {
-              cacheName: 'firebase-cache',
-              expiration: { maxEntries: 50, maxAgeSeconds: 60 * 60 * 24 * 7 },
-              cacheableResponse: { statuses: [0, 200] },
-              networkTimeoutSeconds: 3,
             },
           },
         ],
