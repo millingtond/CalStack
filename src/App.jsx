@@ -5,7 +5,13 @@ import {
   PieChart, Pie, RadarChart, Radar, PolarGrid, PolarAngleAxis,
 } from 'recharts';
 import { load, save, clearAll, setUid } from './storage';
-import { waitForAuth } from './firebase';
+import {
+  auth, waitForAuth,
+  signInWithGoogle, signInWithApple,
+  signInWithEmail, createEmailAccount,
+  sendMagicLink, completeMagicLinkSignIn,
+  signOutUser,
+} from './firebase';
 import {
   MEALS, MEAL_ICONS, MEAL_LABELS, ACTIVITY_LEVELS, WEEKLY_GOALS,
   dateKey, formatDate, calcTDEE,
@@ -655,6 +661,206 @@ function Onboarding({ onComplete }) {
   );
 }
 
+/* ─── Auth Modal ─────────────────────────────────────────────────────────── */
+
+function AuthModal({ currentUser, onSuccess, onClose }) {
+  const [tab, setTab] = useState('google');
+  const [emailMode, setEmailMode] = useState('signin');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [magicSent, setMagicSent] = useState(false);
+
+  function friendlyError(code) {
+    const map = {
+      'auth/wrong-password': 'Incorrect password.',
+      'auth/invalid-credential': 'Incorrect email or password.',
+      'auth/user-not-found': 'No account found with that email.',
+      'auth/email-already-in-use': 'An account with that email already exists — try signing in.',
+      'auth/weak-password': 'Password must be at least 6 characters.',
+      'auth/popup-blocked': 'Popup blocked. Please allow popups for this site and try again.',
+      'auth/popup-closed-by-user': '',
+      'auth/invalid-email': 'Invalid email address.',
+      'auth/operation-not-allowed': 'This sign-in method is not enabled yet.',
+      'auth/too-many-requests': 'Too many attempts. Please try again later.',
+    };
+    return map[code] || 'Something went wrong. Please try again.';
+  }
+
+  const run = async (fn) => {
+    setBusy(true);
+    setError('');
+    try {
+      const user = await fn();
+      if (user) onSuccess(user);
+    } catch (err) {
+      const msg = friendlyError(err.code);
+      if (msg) setError(msg);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleEmail = (e) => {
+    e.preventDefault();
+    if (emailMode === 'signup' && password !== confirmPassword) {
+      setError('Passwords do not match.');
+      return;
+    }
+    run(() => emailMode === 'signin' ? signInWithEmail(email, password) : createEmailAccount(email, password));
+  };
+
+  const handleMagicLink = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      await sendMagicLink(email);
+      setMagicSent(true);
+    } catch (err) {
+      setError(friendlyError(err.code));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inputStyle = {
+    width: '100%', padding: '12px 14px', fontSize: 15, borderRadius: 12,
+    border: '2px solid #e2e8f0', outline: 'none', boxSizing: 'border-box',
+  };
+  const focusOrange = (e) => (e.target.style.borderColor = '#f97316');
+  const blurGray   = (e) => (e.target.style.borderColor = '#e2e8f0');
+
+  const tabs = [
+    { id: 'google', label: 'Google' },
+    { id: 'apple',  label: 'Apple'  },
+    { id: 'email',  label: 'Email'  },
+    { id: 'magic',  label: 'Magic'  },
+  ];
+
+  const isLinked = currentUser && !currentUser.isAnonymous;
+
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }}>
+      <div onClick={e => e.stopPropagation()} style={{ backgroundColor: '#fff', borderRadius: '24px 24px 0 0', padding: '24px 20px 40px', width: '100%', maxWidth: 480, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div className="flex justify-between items-center mb-4">
+          <div style={{ fontSize: 20, fontWeight: 700, color: '#1e293b' }}>
+            {isLinked ? 'Manage Account' : 'Sign In'}
+          </div>
+          <button onClick={onClose} style={{ width: 32, height: 32, borderRadius: 8, border: 'none', backgroundColor: '#f1f5f9', color: '#64748b', fontSize: 20, lineHeight: 1, cursor: 'pointer' }}>×</button>
+        </div>
+
+        {isLinked ? (
+          <div style={{ textAlign: 'center', padding: '16px 0' }}>
+            <div style={{ width: 64, height: 64, borderRadius: '50%', backgroundColor: '#fff7ed', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px', fontSize: 28 }}>
+              {currentUser.photoURL
+                ? <img src={currentUser.photoURL} alt="" style={{ width: 64, height: 64, borderRadius: '50%' }} />
+                : '👤'}
+            </div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: '#1e293b' }}>{currentUser.displayName || currentUser.email || 'Signed in'}</div>
+            {currentUser.email && currentUser.displayName && (
+              <div style={{ fontSize: 13, color: '#94a3b8', marginTop: 4 }}>{currentUser.email}</div>
+            )}
+            <div className="flex justify-center gap-2 mt-3 flex-wrap">
+              {currentUser.providerData.map(p => {
+                const icons = { 'google.com': '🔵 Google', 'apple.com': '⚫ Apple', 'password': '✉ Email', 'emailLink': '🔗 Magic Link' };
+                return (
+                  <span key={p.providerId} style={{ fontSize: 11, fontWeight: 600, backgroundColor: '#f1f5f9', color: '#64748b', padding: '3px 10px', borderRadius: 20 }}>
+                    {icons[p.providerId] || p.providerId}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        ) : (
+          <>
+            <div style={{ fontSize: 14, color: '#64748b', marginBottom: 20 }}>
+              Sign in to sync your data across all your devices. Your existing data will be preserved.
+            </div>
+
+            {/* Tabs */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4, marginBottom: 20, backgroundColor: '#f8fafc', borderRadius: 12, padding: 4 }}>
+              {tabs.map(t => (
+                <button key={t.id} onClick={() => { setTab(t.id); setError(''); setMagicSent(false); }}
+                  style={{ padding: '8px 4px', borderRadius: 8, fontSize: 12, fontWeight: 600, border: 'none', cursor: 'pointer',
+                    backgroundColor: tab === t.id ? '#fff' : 'transparent',
+                    color: tab === t.id ? '#f97316' : '#64748b',
+                    boxShadow: tab === t.id ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+                  }}>{t.label}</button>
+              ))}
+            </div>
+
+            {error && (
+              <div style={{ backgroundColor: '#fef2f2', border: '1px solid #fecaca', borderRadius: 10, padding: '10px 14px', fontSize: 13, color: '#dc2626', marginBottom: 14 }}>
+                {error}
+              </div>
+            )}
+
+            {tab === 'google' && (
+              <button onClick={() => run(signInWithGoogle)} disabled={busy}
+                style={{ width: '100%', padding: '14px 20px', borderRadius: 14, border: '2px solid #e2e8f0', backgroundColor: '#fff', fontSize: 15, fontWeight: 600, color: '#1e293b', cursor: busy ? 'default' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
+                <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.4 1.2 8.7 3.2l6.5-6.5C35.2 2.7 29.9 0 24 0 14.8 0 7 5.8 3.3 14.2l7.6 5.9C12.7 13.6 17.9 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h12.7c-.6 3-2.3 5.5-4.8 7.2l7.4 5.7c4.3-4 6.7-9.9 7.2-17z"/><path fill="#FBBC05" d="M10.9 28.6A14.9 14.9 0 0 1 9.5 24c0-1.6.3-3.2.8-4.6L2.7 13.5A24 24 0 0 0 0 24c0 3.9.9 7.5 2.7 10.7l8.2-6.1z"/><path fill="#34A853" d="M24 48c6 0 11-2 14.6-5.3l-7.4-5.7c-2 1.4-4.6 2.2-7.2 2.2-6.1 0-11.3-4.1-13.1-9.6l-7.6 5.9C7 42.2 14.8 48 24 48z"/></svg>
+                {busy ? 'Signing in…' : 'Continue with Google'}
+              </button>
+            )}
+
+            {tab === 'apple' && (
+              <button onClick={() => run(signInWithApple)} disabled={busy}
+                style={{ width: '100%', padding: '14px 20px', borderRadius: 14, border: 'none', backgroundColor: '#000', fontSize: 15, fontWeight: 600, color: '#fff', cursor: busy ? 'default' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
+                <svg width="18" height="22" viewBox="0 0 814 1000" fill="white"><path d="M788.1 340.9c-5.8 4.5-108.2 62.2-108.2 190.5 0 148.4 130.3 200.9 134.2 202.2-.6 3.2-20.7 71.9-68.7 141.9-42.8 61.6-87.5 123.1-155.5 123.1s-85.5-39.5-164-39.5c-76 0-103.7 40.8-165.9 40.8s-105-37.8-155.3-121.8C161.1 766.5 110 619.8 110 480.9c0-232.6 155.3-355.6 304.3-355.6 80.8 0 148.1 53.3 199.2 53.3 48.9 0 126.5-56.7 218.7-56.7 35.6 0 133.8 4.5 191.2 104.7zm-252.3-161.1c31.1-36.9 53.1-88.1 53.1-139.3 0-7.1-.6-14.3-1.9-20.1-50.6 1.9-110.8 33.7-147.1 75.8-28.5 32.4-55.1 83.6-55.1 135.5 0 7.8 1.3 15.6 1.9 18.1 3.2.6 8.4 1.3 13.6 1.3 45.4 0 102.5-30.4 135.5-71.3z"/></svg>
+                {busy ? 'Signing in…' : 'Continue with Apple'}
+              </button>
+            )}
+
+            {tab === 'email' && (
+              <form onSubmit={handleEmail} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email address" required style={inputStyle} onFocus={focusOrange} onBlur={blurGray} />
+                <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" required style={inputStyle} onFocus={focusOrange} onBlur={blurGray} />
+                {emailMode === 'signup' && (
+                  <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} placeholder="Confirm password" required style={inputStyle} onFocus={focusOrange} onBlur={blurGray} />
+                )}
+                <button type="submit" disabled={busy}
+                  style={{ width: '100%', padding: 14, borderRadius: 14, border: 'none', backgroundColor: '#f97316', color: '#fff', fontSize: 15, fontWeight: 700, cursor: busy ? 'default' : 'pointer', marginTop: 4 }}>
+                  {busy ? 'Please wait…' : emailMode === 'signin' ? 'Sign In' : 'Create Account'}
+                </button>
+                <button type="button" onClick={() => { setEmailMode(m => m === 'signin' ? 'signup' : 'signin'); setError(''); }}
+                  style={{ background: 'none', border: 'none', color: '#f97316', fontSize: 13, cursor: 'pointer', padding: 4 }}>
+                  {emailMode === 'signin' ? "Don't have an account? Sign Up" : 'Already have an account? Sign In'}
+                </button>
+              </form>
+            )}
+
+            {tab === 'magic' && (
+              magicSent ? (
+                <div style={{ textAlign: 'center', padding: '24px 0' }}>
+                  <div style={{ fontSize: 48, marginBottom: 12 }}>📧</div>
+                  <div style={{ fontSize: 17, fontWeight: 700, color: '#1e293b', marginBottom: 8 }}>Check your inbox</div>
+                  <div style={{ fontSize: 14, color: '#64748b', lineHeight: 1.6 }}>
+                    We sent a sign-in link to <strong>{email}</strong>. Click it on this device to sign in — no password needed.
+                  </div>
+                </div>
+              ) : (
+                <form onSubmit={handleMagicLink} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <div style={{ fontSize: 13, color: '#64748b', marginBottom: 4 }}>
+                    We'll email you a one-click sign-in link. No password required.
+                  </div>
+                  <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email address" required style={inputStyle} onFocus={focusOrange} onBlur={blurGray} />
+                  <button type="submit" disabled={busy}
+                    style={{ width: '100%', padding: 14, borderRadius: 14, border: 'none', backgroundColor: '#f97316', color: '#fff', fontSize: 15, fontWeight: 700, cursor: busy ? 'default' : 'pointer' }}>
+                    {busy ? 'Sending…' : 'Send Magic Link'}
+                  </button>
+                </form>
+              )
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ─── Main App ───────────────────────────────────────────────────────────── */
 
 export default function App() {
@@ -688,35 +894,58 @@ export default function App() {
   const [newWeight, setNewWeight] = useState('');
   const [statsTab, setStatsTab] = useState('weight');
   const [editingProfile, setEditingProfile] = useState(null);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+
+  // ── Load data for a given uid ──
+  const loadUserData = useCallback(async (uid) => {
+    setUid(uid);
+    const p = await load('profile', null);
+    if (p) {
+      setProfile(p);
+      const [wh, rf, cs, cf, sm] = await Promise.all([
+        load('weight-history', []),
+        load('recent-foods', []),
+        load('calorie-summary', {}),
+        load('custom-foods', []),
+        load('saved-meals', []),
+      ]);
+      setWeightHistory(wh);
+      setRecentFoods(rf);
+      setCalorieSummary(cs);
+      setCustomFoods(cf);
+      setSavedMeals(sm);
+    } else {
+      setProfile(null);
+      setWeightHistory([]);
+      setRecentFoods([]);
+      setCalorieSummary({});
+      setCustomFoods([]);
+      setSavedMeals([]);
+      setDayLog({ breakfast: [], lunch: [], dinner: [], snacks: [], water: 0, exercises: [] });
+    }
+  }, []);
 
   // ── Load initial data ──
   useEffect(() => {
     (async () => {
       try {
         const uid = await waitForAuth();
-        setUid(uid);
-        const p = await load('profile', null);
-        if (p) {
-          setProfile(p);
-          const [wh, rf, cs, cf, sm] = await Promise.all([
-            load('weight-history', []),
-            load('recent-foods', []),
-            load('calorie-summary', {}),
-            load('custom-foods', []),
-            load('saved-meals', []),
-          ]);
-          setWeightHistory(wh);
-          setRecentFoods(rf);
-          setCalorieSummary(cs);
-          setCustomFoods(cf);
-          setSavedMeals(sm);
+        setCurrentUser(auth.currentUser);
+        // Complete magic link sign-in if the URL contains one
+        try {
+          const magicUser = await completeMagicLinkSignIn();
+          if (magicUser) setCurrentUser(magicUser);
+        } catch (e) {
+          console.warn('Magic link sign-in failed:', e);
         }
+        await loadUserData(auth.currentUser?.uid || uid);
       } catch (e) {
         console.error('Init error:', e);
       }
       setLoading(false);
     })();
-  }, []);
+  }, [loadUserData]);
 
   // ── Load day log when date changes ──
   useEffect(() => {
@@ -984,6 +1213,34 @@ export default function App() {
     setProfile(null);
     setDayLog({ breakfast: [], lunch: [], dinner: [], snacks: [] });
     setWeightHistory([]);
+    setScreen('dashboard');
+  };
+
+  // ── Auth handlers ──
+  const handleAuthSuccess = async (user) => {
+    setCurrentUser(user);
+    setShowAuthModal(false);
+    // If the UID changed (credential-already-in-use path), reload data for the new account
+    if (user.uid !== auth.currentUser?.uid) {
+      setUid(user.uid);
+    }
+    await loadUserData(user.uid);
+  };
+
+  const handleSignOut = async () => {
+    if (!confirm('Sign out? You can sign back in any time.')) return;
+    await signOutUser();
+    // Sign in anonymously so the app still works without an account
+    const uid = await waitForAuth();
+    setCurrentUser(auth.currentUser);
+    setUid(uid);
+    setProfile(null);
+    setWeightHistory([]);
+    setRecentFoods([]);
+    setCalorieSummary({});
+    setCustomFoods([]);
+    setSavedMeals([]);
+    setDayLog({ breakfast: [], lunch: [], dinner: [], snacks: [], water: 0, exercises: [] });
     setScreen('dashboard');
   };
 
@@ -1697,6 +1954,58 @@ export default function App() {
         {/* ═══ SETTINGS ═══ */}
         {screen === 'settings' && (
           <div className="slide-up" style={{ paddingTop: 16 }}>
+
+            {/* ── Account card ── */}
+            <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', marginBottom: 16 }}>
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#1e293b', marginBottom: 14 }}>Account</div>
+              {currentUser && !currentUser.isAnonymous ? (
+                <div>
+                  <div className="flex items-center gap-3 mb-14px">
+                    <div style={{ width: 44, height: 44, borderRadius: '50%', backgroundColor: '#fff7ed', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', flexShrink: 0 }}>
+                      {currentUser.photoURL
+                        ? <img src={currentUser.photoURL} alt="" style={{ width: 44, height: 44 }} />
+                        : <span style={{ fontSize: 20 }}>👤</span>}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: '#1e293b', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {currentUser.displayName || currentUser.email || 'Signed in'}
+                      </div>
+                      {currentUser.email && currentUser.displayName && (
+                        <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 2 }}>{currentUser.email}</div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex gap-2 flex-wrap" style={{ marginTop: 12, marginBottom: 14 }}>
+                    {currentUser.providerData.map(p => {
+                      const icons = { 'google.com': '🔵 Google', 'apple.com': '⚫ Apple', 'password': '✉ Email', 'emailLink': '🔗 Magic Link' };
+                      return (
+                        <span key={p.providerId} style={{ fontSize: 11, fontWeight: 600, backgroundColor: '#f1f5f9', color: '#64748b', padding: '3px 10px', borderRadius: 20 }}>
+                          {icons[p.providerId] || p.providerId}
+                        </span>
+                      );
+                    })}
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={() => setShowAuthModal(true)} style={{ flex: 1, padding: '10px 0', borderRadius: 12, fontSize: 13, fontWeight: 600, border: '2px solid #e2e8f0', backgroundColor: '#fff', color: '#64748b', cursor: 'pointer' }}>
+                      Manage
+                    </button>
+                    <button onClick={handleSignOut} style={{ flex: 1, padding: '10px 0', borderRadius: 12, fontSize: 13, fontWeight: 600, border: '2px solid #fecaca', backgroundColor: '#fef2f2', color: '#ef4444', cursor: 'pointer' }}>
+                      Sign Out
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <div style={{ fontSize: 14, color: '#64748b', marginBottom: 14 }}>
+                    You're using a <strong>guest account</strong>. Sign in to sync your data across devices.
+                  </div>
+                  <button onClick={() => setShowAuthModal(true)} style={{ width: '100%', padding: 13, borderRadius: 14, border: 'none', backgroundColor: '#f97316', color: '#fff', fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>
+                    Sign In / Create Account
+                  </button>
+                </div>
+              )}
+            </div>
+
             <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', marginBottom: 16 }}>
               <div style={{ fontSize: 16, fontWeight: 700, color: '#1e293b', marginBottom: 16 }}>Profile</div>
               <div className="flex flex-col gap-3">
@@ -1837,6 +2146,7 @@ export default function App() {
       {showCustomFoodModal && <CustomFoodModal onSave={saveCustomFood} onClose={() => setShowCustomFoodModal(false)} />}
       {saveMealTarget && <SaveMealModal mealLabel={saveMealTarget.label} onSave={name => saveMealTemplate(saveMealTarget.meal, name)} onClose={() => setSaveMealTarget(null)} />}
       {loadMealTarget && <SavedMealsModal savedMeals={savedMeals} onLoad={loadMealTemplate} onDelete={deleteMealTemplate} onClose={() => setLoadMealTarget(null)} />}
+      {showAuthModal && <AuthModal currentUser={currentUser} onSuccess={handleAuthSuccess} onClose={() => setShowAuthModal(false)} />}
     </div>
   );
 }
