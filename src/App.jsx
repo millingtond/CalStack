@@ -1490,6 +1490,207 @@ export default function App() {
                 </div>
               );
             })()}
+            </>}
+
+            {statsTab === 'insights' && (() => {
+              const bmr = Math.round(target / (profile.activityLevel || 1.55) * ((profile.weeklyGoalOffset || 0) === 0 ? 1 : 1) + Math.abs(profile.weeklyGoalOffset || 0));
+              const actualBmr = Math.round(profile.tdee / (profile.activityLevel || 1.55));
+              const tooltipStyle = { borderRadius: 12, border: 'none', boxShadow: '0 4px 20px rgba(0,0,0,0.1)', fontSize: 12 };
+
+              // Build 14-day dataset
+              const last14 = Array.from({ length: 14 }, (_, i) => {
+                const d = new Date(); d.setDate(d.getDate() - (13 - i));
+                const k = dateKey(d);
+                const s = calorieSummary[k];
+                const cal = getSummaryCal(s);
+                return {
+                  date: k, label: d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }),
+                  cal, deficit: cal > 0 ? cal - target : null,
+                  p: s?.p || 0, c: s?.c || 0, f: s?.f || 0,
+                };
+              });
+              const logged14 = last14.filter(d => d.cal > 0);
+
+              // 7-day rolling average
+              const withRolling = last14.map((d, i) => {
+                const window = last14.slice(Math.max(0, i - 6), i + 1).filter(x => x.cal > 0);
+                return { ...d, rolling: window.length > 0 ? Math.round(window.reduce((s, x) => s + x.cal, 0) / window.length) : null };
+              });
+
+              // Day-of-week averages
+              const dowMap = {};
+              Object.entries(calorieSummary).forEach(([k, v]) => {
+                const cal = getSummaryCal(v);
+                if (!cal) return;
+                const dow = new Date(k + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short' });
+                if (!dowMap[dow]) dowMap[dow] = { total: 0, count: 0 };
+                dowMap[dow].total += cal; dowMap[dow].count++;
+              });
+              const dowOrder = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+              const dowData = dowOrder.map(d => ({ day: d, avg: dowMap[d] ? Math.round(dowMap[d].total / dowMap[d].count) : 0 }));
+
+              // Macro donut for today
+              const todayKey = dateKey();
+              const todayS = calorieSummary[todayKey];
+              const tp = todayS?.p || totals.protein;
+              const tc = todayS?.c || totals.carbs;
+              const tf = todayS?.f || totals.fat;
+              const macroKcal = { Protein: Math.round(tp * 4), Carbs: Math.round(tc * 4), Fat: Math.round(tf * 9) };
+              const macroTotal = macroKcal.Protein + macroKcal.Carbs + macroKcal.Fat;
+              const macroColors = { Protein: '#3b82f6', Carbs: '#8b5cf6', Fat: '#ef4444' };
+              const pieData = Object.entries(macroKcal).filter(([, v]) => v > 0).map(([name, value]) => ({ name, value }));
+
+              return (
+                <div>
+                  {/* ── Chart 1: Calorie intake vs TDEE/BMR ── */}
+                  {logged14.length >= 2 && (
+                    <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', marginBottom: 16 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: '#1e293b', marginBottom: 4 }}>Calories vs Targets</div>
+                      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 16 }}>Daily intake with 7-day rolling average</div>
+                      <ResponsiveContainer width="100%" height={200}>
+                        <ComposedChart data={withRolling} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                          <defs>
+                            <linearGradient id="cBarGrad" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="0%" stopColor="#f97316" stopOpacity={0.7} />
+                              <stop offset="100%" stopColor="#f97316" stopOpacity={0.2} />
+                            </linearGradient>
+                          </defs>
+                          <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={2} />
+                          <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={35} domain={[0, 'dataMax + 300']} />
+                          <Tooltip contentStyle={tooltipStyle} formatter={(v, n) => [`${v} kcal`, n]} labelFormatter={l => l} />
+                          <ReferenceLine y={target} stroke="#f97316" strokeDasharray="4 3" strokeOpacity={0.6} label={{ value: 'Target', position: 'insideTopRight', fontSize: 9, fill: '#f97316' }} />
+                          <ReferenceLine y={profile.tdee} stroke="#10b981" strokeDasharray="4 3" strokeOpacity={0.5} label={{ value: 'TDEE', position: 'insideTopRight', fontSize: 9, fill: '#10b981' }} />
+                          <ReferenceLine y={actualBmr} stroke="#94a3b8" strokeDasharray="3 3" strokeOpacity={0.4} label={{ value: 'BMR', position: 'insideTopRight', fontSize: 9, fill: '#94a3b8' }} />
+                          <Bar dataKey="cal" name="Calories" fill="url(#cBarGrad)" radius={[4, 4, 0, 0]} maxBarSize={24} />
+                          <Line dataKey="rolling" name="7-day avg" stroke="#1e293b" strokeWidth={2} dot={false} connectNulls />
+                        </ComposedChart>
+                      </ResponsiveContainer>
+                      <div className="flex gap-4 mt-3" style={{ justifyContent: 'center' }}>
+                        {[{ color: '#f97316', label: `Target: ${target}` }, { color: '#10b981', label: `TDEE: ${profile.tdee}` }, { color: '#94a3b8', label: `BMR: ${actualBmr}` }].map(l => (
+                          <div key={l.label} className="flex items-center gap-1">
+                            <div style={{ width: 10, height: 2, backgroundColor: l.color, borderRadius: 1 }} />
+                            <span style={{ fontSize: 10, color: '#94a3b8' }}>{l.label}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Chart 2: Deficit / Surplus ── */}
+                  {logged14.length >= 2 && (
+                    <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', marginBottom: 16 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: '#1e293b', marginBottom: 4 }}>Deficit / Surplus</div>
+                      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 16 }}>How far above or below your target each day</div>
+                      <ResponsiveContainer width="100%" height={180}>
+                        <BarChart data={last14.filter(d => d.deficit !== null)} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                          <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={1} />
+                          <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={40} />
+                          <Tooltip contentStyle={tooltipStyle}
+                            formatter={(v) => [`${v > 0 ? '+' : ''}${v} kcal`, v > 0 ? 'Surplus' : 'Deficit']} />
+                          <ReferenceLine y={0} stroke="#e2e8f0" strokeWidth={1.5} />
+                          <Bar dataKey="deficit" name="Difference" radius={[3, 3, 0, 0]} maxBarSize={24}>
+                            {last14.filter(d => d.deficit !== null).map((d, i) => (
+                              <Cell key={i} fill={d.deficit <= 0 ? '#10b981' : d.deficit > 300 ? '#ef4444' : '#f59e0b'} />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                      <div className="flex gap-4 mt-2" style={{ justifyContent: 'center' }}>
+                        {[{ color: '#10b981', label: 'Deficit (good)' }, { color: '#f59e0b', label: 'Slight surplus' }, { color: '#ef4444', label: 'Large surplus' }].map(l => (
+                          <div key={l.label} className="flex items-center gap-1">
+                            <div style={{ width: 8, height: 8, borderRadius: 2, backgroundColor: l.color }} />
+                            <span style={{ fontSize: 10, color: '#94a3b8' }}>{l.label}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Chart 3: Today's Macro Split ── */}
+                  {macroTotal > 0 && (
+                    <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', marginBottom: 16 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: '#1e293b', marginBottom: 4 }}>Today's Macro Split</div>
+                      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Calorie contribution by macronutrient</div>
+                      <div className="flex items-center gap-4">
+                        <PieChart width={140} height={140}>
+                          <Pie data={pieData} cx={65} cy={65} innerRadius={42} outerRadius={62} paddingAngle={3} dataKey="value" strokeWidth={0}>
+                            {pieData.map((entry) => <Cell key={entry.name} fill={macroColors[entry.name]} />)}
+                          </Pie>
+                          <Tooltip contentStyle={tooltipStyle} formatter={(v, n) => [`${v} kcal (${Math.round(v / macroTotal * 100)}%)`, n]} />
+                        </PieChart>
+                        <div className="flex flex-col gap-3" style={{ flex: 1 }}>
+                          {Object.entries(macroKcal).map(([name, kcal]) => (
+                            <div key={name}>
+                              <div className="flex justify-between" style={{ marginBottom: 3 }}>
+                                <span style={{ fontSize: 12, fontWeight: 600, color: macroColors[name] }}>{name}</span>
+                                <span style={{ fontSize: 11, color: '#94a3b8' }}>{kcal} kcal · {macroTotal > 0 ? Math.round(kcal / macroTotal * 100) : 0}%</span>
+                              </div>
+                              <div style={{ height: 5, backgroundColor: 'rgba(0,0,0,0.06)', borderRadius: 3, overflow: 'hidden' }}>
+                                <div style={{ height: '100%', width: `${macroTotal > 0 ? (kcal / macroTotal) * 100 : 0}%`, backgroundColor: macroColors[name], borderRadius: 3 }} />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Chart 4: Macro Trend (Stacked Area) ── */}
+                  {logged14.length >= 3 && (
+                    <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', marginBottom: 16 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: '#1e293b', marginBottom: 4 }}>Macro Trend</div>
+                      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 16 }}>Daily grams of protein, carbs and fat</div>
+                      <ResponsiveContainer width="100%" height={180}>
+                        <AreaChart data={logged14} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                          <defs>
+                            {[['pGrad', '#3b82f6'], ['cGrad', '#8b5cf6'], ['fGrad', '#ef4444']].map(([id, color]) => (
+                              <linearGradient key={id} id={id} x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="5%" stopColor={color} stopOpacity={0.5} />
+                                <stop offset="95%" stopColor={color} stopOpacity={0.05} />
+                              </linearGradient>
+                            ))}
+                          </defs>
+                          <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} interval={1} />
+                          <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={30} />
+                          <Tooltip contentStyle={tooltipStyle} formatter={(v, n) => [`${v}g`, n]} />
+                          <Area type="monotone" dataKey="p" name="Protein" stackId="1" stroke="#3b82f6" strokeWidth={1.5} fill="url(#pGrad)" />
+                          <Area type="monotone" dataKey="c" name="Carbs" stackId="1" stroke="#8b5cf6" strokeWidth={1.5} fill="url(#cGrad)" />
+                          <Area type="monotone" dataKey="f" name="Fat" stackId="1" stroke="#ef4444" strokeWidth={1.5} fill="url(#fGrad)" />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
+                  )}
+
+                  {/* ── Chart 5: Day of Week Pattern ── */}
+                  {Object.keys(dowMap).length >= 3 && (
+                    <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', marginBottom: 16 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: '#1e293b', marginBottom: 4 }}>Intake by Day of Week</div>
+                      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 16 }}>Your average calories — do you overeat on weekends?</div>
+                      <ResponsiveContainer width="100%" height={160}>
+                        <BarChart data={dowData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                          <XAxis dataKey="day" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+                          <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={35} domain={[0, 'dataMax + 200']} />
+                          <Tooltip contentStyle={tooltipStyle} formatter={v => [`${v} kcal`, 'Avg']} />
+                          <ReferenceLine y={target} stroke="#f97316" strokeDasharray="4 3" strokeOpacity={0.5} />
+                          <Bar dataKey="avg" radius={[6, 6, 0, 0]} maxBarSize={36}>
+                            {dowData.map((d, i) => (
+                              <Cell key={i} fill={d.avg === 0 ? '#f1f5f9' : d.avg > target ? '#ef4444' : d.avg > target * 0.9 ? '#f59e0b' : '#10b981'} />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  )}
+
+                  {logged14.length < 2 && (
+                    <div style={{ backgroundColor: '#fff', borderRadius: 20, padding: 40, boxShadow: '0 1px 3px rgba(0,0,0,0.04)', textAlign: 'center' }}>
+                      <div style={{ fontSize: 32, marginBottom: 12 }}>📊</div>
+                      <div style={{ fontSize: 14, color: '#94a3b8' }}>Log food for at least 2 days to see your charts</div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         )}
 
