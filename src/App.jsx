@@ -239,7 +239,12 @@ function QuickAddModal({ meal, onConfirm, onClose }) {
 function InstallPrompt() {
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [showIOSTip, setShowIOSTip] = useState(false);
-  const [dismissed, setDismissed] = useState(() => localStorage.getItem('pwa-dismissed') === '1');
+  const [dismissed, setDismissed] = useState(() => {
+    const ts = localStorage.getItem('pwa-dismissed');
+    if (!ts) return false;
+    // Re-show after 14 days in case they uninstalled and came back
+    return Date.now() - parseInt(ts) < 14 * 24 * 60 * 60 * 1000;
+  });
 
   const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
   const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
@@ -253,7 +258,7 @@ function InstallPrompt() {
   }, []);
 
   const dismiss = () => {
-    localStorage.setItem('pwa-dismissed', '1');
+    localStorage.setItem('pwa-dismissed', Date.now().toString());
     setDismissed(true);
     setDeferredPrompt(null);
     setShowIOSTip(false);
