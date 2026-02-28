@@ -3,6 +3,13 @@ import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
+  server: {
+    headers: {
+      // Required for Firebase popup auth (Google/Apple sign-in) to work.
+      // 'same-origin-allow-popups' lets OAuth popups communicate back to the opener.
+      'Cross-Origin-Opener-Policy': 'same-origin-allow-popups',
+    },
+  },
   plugins: [
     react(),
     VitePWA({
