@@ -322,12 +322,18 @@ function BarcodeScanner({ onDetect, onClose }) {
   const [scanning, setScanning] = useState(false);
   const [manualCode, setManualCode] = useState('');
   const supported = typeof window !== 'undefined' && 'BarcodeDetector' in window;
+  const canUseCamera = supported && typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia;
 
   useEffect(() => {
-    if (!supported) return;
+    if (!canUseCamera) return;
+    let active = true;
     let stream;
     navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
       .then(s => {
+        if (!active) {
+          s.getTracks().forEach(t => t.stop());
+          return;
+        }
         stream = s;
         if (videoRef.current) {
           videoRef.current.srcObject = s;
@@ -335,12 +341,15 @@ function BarcodeScanner({ onDetect, onClose }) {
           setScanning(true);
         }
       })
-      .catch(() => setError('Camera access denied. Enter barcode manually below.'));
+      .catch(() => {
+        if (active) setError('Camera access denied. Enter barcode manually below.');
+      });
     return () => {
+      active = false;
       if (stream) stream.getTracks().forEach(t => t.stop());
       cancelAnimationFrame(animRef.current);
     };
-  }, [supported]);
+  }, [canUseCamera]);
 
   useEffect(() => {
     if (!scanning || !supported) return;
@@ -362,7 +371,7 @@ function BarcodeScanner({ onDetect, onClose }) {
     <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 24 }}>
       <div style={{ width: '100%', maxWidth: 400 }}>
         <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', textAlign: 'center', marginBottom: 20 }}>Scan Barcode</div>
-        {supported && !error && (
+        {canUseCamera && !error && (
           <div style={{ position: 'relative', borderRadius: 16, overflow: 'hidden', marginBottom: 20, aspectRatio: '4/3', backgroundColor: '#000' }}>
             <video ref={videoRef} autoPlay playsInline muted style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
             <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
@@ -370,9 +379,11 @@ function BarcodeScanner({ onDetect, onClose }) {
             </div>
           </div>
         )}
-        {(error || !supported) && (
+        {(error || !canUseCamera) && (
           <div style={{ padding: 16, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 12, marginBottom: 16, fontSize: 13, color: '#cbd5e1', textAlign: 'center' }}>
-            {error || 'Barcode scanning not supported in this browser.'}
+            {error || (supported
+              ? 'Camera access is unavailable in this browser. Enter barcode manually below.'
+              : 'Barcode scanning not supported in this browser.')}
           </div>
         )}
         <div style={{ fontSize: 13, color: '#94a3b8', textAlign: 'center', marginBottom: 8 }}>Or enter barcode manually</div>
@@ -537,17 +548,24 @@ function SavedMealsModal({ savedMeals, onLoad, onDelete, onClose }) {
 
 /* ─── Onboarding ─────────────────────────────────────────────────────────── */
 
-function Onboarding({ onComplete, onSignIn }) {
+function Onboarding({ currentUser, onComplete, onSignIn }) {
   const [step, setStep] = useState(0);
   const [profile, setProfile] = useState({
-    name: '', gender: 'male', age: 30, heightCm: 175, weightKg: 80,
+    name: currentUser?.displayName || '', gender: 'male', age: 30, heightCm: 175, weightKg: 80,
     activityLevel: 1.375, weeklyGoalOffset: -500,
   });
   const [showSignIn, setShowSignIn] = useState(false);
+  const isSignedIn = currentUser && !currentUser.isAnonymous;
 
   const update = (k, v) => setProfile(p => ({ ...p, [k]: v }));
   const tdee = calcTDEE(profile);
   const target = tdee + profile.weeklyGoalOffset;
+
+  useEffect(() => {
+    if (!profile.name.trim() && currentUser?.displayName) {
+      setProfile(p => ({ ...p, name: currentUser.displayName }));
+    }
+  }, [currentUser?.displayName, profile.name]);
 
   const inputStyle = {
     width: '100%', padding: '14px 16px', fontSize: 16, borderRadius: 14,
@@ -569,6 +587,11 @@ function Onboarding({ onComplete, onSignIn }) {
       <p style={{ fontSize: 15, color: '#94a3b8', marginBottom: 32, lineHeight: 1.5 }}>
         We'll calculate your daily calorie target based on a few details about you. Your data syncs automatically via Firebase.
       </p>
+      {isSignedIn && (
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#047857', marginBottom: 16 }}>
+          Signed in as {currentUser.displayName || currentUser.email || 'your account'}. Finish setup to start syncing.
+        </div>
+      )}
       <label style={{ fontSize: 13, fontWeight: 600, color: '#64748b', display: 'block', marginBottom: 6 }}>Your name</label>
       <input value={profile.name} onChange={e => update('name', e.target.value)} placeholder="Enter your name" style={inputStyle} autoFocus
         onFocus={e => (e.target.style.borderColor = '#f97316')} onBlur={e => (e.target.style.borderColor = '#e2e8f0')} />
@@ -952,15 +975,14 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const uid = await waitForAuth();
-        setCurrentUser(auth.currentUser);
-        let activeUid = uid;
+        let activeUid = await waitForAuth({ allowAnonymous: false });
+        let activeUser = auth.currentUser;
 
         // Handle return from Google/Apple redirect sign-in (mobile/PWA)
         try {
           const redirectUser = await handleRedirectResult();
           if (redirectUser) {
-            setCurrentUser(redirectUser);
+            activeUser = redirectUser;
             activeUid = redirectUser.uid;
           }
         } catch (e) {
@@ -971,13 +993,19 @@ export default function App() {
         try {
           const magicUser = await completeMagicLinkSignIn();
           if (magicUser) {
-            setCurrentUser(magicUser);
+            activeUser = magicUser;
             activeUid = magicUser.uid;
           }
         } catch (e) {
           console.warn('Magic link sign-in failed:', e);
         }
 
+        if (!activeUid) {
+          activeUid = await waitForAuth();
+          activeUser = auth.currentUser;
+        }
+
+        setCurrentUser(activeUser);
         await loadUserData(activeUid);
       } catch (e) {
         console.error('Init error:', e);
@@ -1135,11 +1163,23 @@ export default function App() {
 
   // ── Food search via Open Food Facts ──
   const searchFood = useCallback(async (query) => {
-    if (!query.trim() || query.length < 2) { setSearchResults([]); return; }
+    const normalizedQuery = query.trim();
+    const cacheKey = normalizedQuery.toLowerCase();
+
+    if (!normalizedQuery || normalizedQuery.length < 2) {
+      if (searchAbort.current) {
+        searchAbort.current.abort();
+        searchAbort.current = null;
+      }
+      setSearching(false);
+      setSearchResults([]);
+      return;
+    }
 
     // Return cached result instantly
-    if (searchCache.current[query]) {
-      setSearchResults(searchCache.current[query]);
+    if (searchCache.current[cacheKey]) {
+      setSearching(false);
+      setSearchResults(searchCache.current[cacheKey]);
       return;
     }
 
@@ -1150,7 +1190,7 @@ export default function App() {
 
     setSearching(true);
     try {
-      const base = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&json=1&page_size=20&fields=code,product_name,brands,nutriments,image_small_url`;
+      const base = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(normalizedQuery)}&json=1&page_size=20&fields=code,product_name,brands,nutriments,image_small_url`;
       const filterValid = p => p.product_name && p.nutriments && (p.nutriments['energy-kcal_100g'] || p.nutriments['energy-kcal']);
 
       // Try UK-filtered first
@@ -1165,12 +1205,18 @@ export default function App() {
         results = (worldData.products || []).filter(filterValid);
       }
 
-      searchCache.current[query] = results;
-      setSearchResults(results);
+      if (searchAbort.current === controller) {
+        searchCache.current[cacheKey] = results;
+        setSearchResults(results);
+      }
     } catch (e) {
-      if (e.name !== 'AbortError') setSearchResults([]);
+      if (e.name !== 'AbortError' && searchAbort.current === controller) setSearchResults([]);
+    } finally {
+      if (searchAbort.current === controller) {
+        searchAbort.current = null;
+        setSearching(false);
+      }
     }
-    setSearching(false);
   }, []);
 
   const handleSearchInput = (val) => {
@@ -1178,6 +1224,11 @@ export default function App() {
     clearTimeout(searchTimer.current);
     searchTimer.current = setTimeout(() => searchFood(val), 300);
   };
+
+  useEffect(() => () => {
+    clearTimeout(searchTimer.current);
+    if (searchAbort.current) searchAbort.current.abort();
+  }, []);
 
   // ── Calculations ──
   const totals = MEALS.reduce((acc, meal) => {
@@ -1292,7 +1343,7 @@ export default function App() {
     );
   }
 
-  if (!profile) return <Onboarding onComplete={p => { setProfile(p); setScreen('dashboard'); }} onSignIn={handleAuthSuccess} />;
+  if (!profile) return <Onboarding currentUser={currentUser} onComplete={p => { setProfile(p); setScreen('dashboard'); }} onSignIn={handleAuthSuccess} />;
 
   const navItems = [
     { id: 'dashboard', icon: '◉', label: 'Today' },

@@ -65,16 +65,17 @@ function shouldUseRedirectAuth() {
 }
 
 /**
- * Wait for anonymous auth to resolve.
- * Returns the uid. Firebase restores the same anonymous uid on revisit
- * so all data persists across sessions on the same device.
+ * Wait for auth state to resolve.
+ * By default this falls back to anonymous auth so the app can always work.
  */
-export function waitForAuth() {
+export function waitForAuth({ allowAnonymous = true } = {}) {
   return new Promise((resolve, reject) => {
     const unsub = onAuthStateChanged(auth, async (user) => {
       unsub();
       if (user) {
         resolve(user.uid);
+      } else if (!allowAnonymous) {
+        resolve(null);
       } else {
         try {
           const cred = await signInAnonymously(auth);
