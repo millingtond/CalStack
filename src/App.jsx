@@ -362,6 +362,7 @@ export default function App() {
   const [portionFood, setPortionFood] = useState(null);
   const [quickAddMeal, setQuickAddMeal] = useState(null);
   const searchTimer = useRef(null);
+  const [recentFoods, setRecentFoods] = useState([]);
 
   const [newWeight, setNewWeight] = useState('');
   const [editingProfile, setEditingProfile] = useState(null);
@@ -376,6 +377,7 @@ export default function App() {
         if (p) {
           setProfile(p);
           setWeightHistory(await load('weight-history', []));
+          setRecentFoods(await load('recent-foods', []));
         }
       } catch (e) {
         console.error('Init error:', e);
@@ -401,6 +403,13 @@ export default function App() {
   const addFoodEntry = async (entry) => {
     const newLog = { ...dayLog, [entry.meal]: [...dayLog[entry.meal], entry] };
     await saveDayLog(newLog);
+    if (entry.brand !== 'Quick add' && entry.caloriesPer100) {
+      const { id, name, brand, caloriesPer100, proteinPer100, carbsPer100, fatPer100 } = entry;
+      const foodRecord = { id, name, brand, caloriesPer100, proteinPer100, carbsPer100, fatPer100 };
+      const updated = [foodRecord, ...recentFoods.filter(f => f.id !== id)].slice(0, 20);
+      setRecentFoods(updated);
+      await save('recent-foods', updated);
+    }
     setPortionFood(null);
     setSearchQuery('');
     setSearchResults([]);
@@ -417,7 +426,7 @@ export default function App() {
     setSearching(true);
     try {
       const res = await fetch(
-        `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&json=1&page_size=20&fields=code,product_name,brands,nutriments,image_small_url`
+        `https://uk.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&json=1&page_size=20&fields=code,product_name,brands,nutriments,image_small_url`
       );
       const data = await res.json();
       setSearchResults(
@@ -508,22 +517,34 @@ export default function App() {
   return (
     <div style={{ backgroundColor: '#fafaf9', minHeight: '100vh', paddingBottom: 80 }}>
 
-      {/* ── Header / Date Nav ── */}
+      {/* ── Header ── */}
       <div style={{ padding: '16px 20px 12px', backgroundColor: '#fff', borderBottom: '1px solid rgba(0,0,0,0.05)', position: 'sticky', top: 0, zIndex: 100 }}>
         <div className="flex items-center justify-between" style={{ maxWidth: 480, margin: '0 auto' }}>
-          <button onClick={() => changeDate(-1)} style={{
-            width: 36, height: 36, borderRadius: 10, border: '1.5px solid #e2e8f0', backgroundColor: '#fff',
-            cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b',
-          }}>←</button>
+          {['dashboard', 'log', 'search'].includes(screen) ? (
+            <button onClick={() => changeDate(-1)} style={{
+              width: 36, height: 36, borderRadius: 10, border: '1.5px solid #e2e8f0', backgroundColor: '#fff',
+              cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b',
+            }}>←</button>
+          ) : <div style={{ width: 36 }} />}
           <div className="text-center">
-            <div style={{ fontSize: 16, fontWeight: 700, color: '#1e293b' }}>{isToday ? 'Today' : formatDate(selectedDate)}</div>
-            {!isToday && <div style={{ fontSize: 11, color: '#94a3b8' }}>{selectedDate}</div>}
+            {['dashboard', 'log', 'search'].includes(screen) ? (
+              <>
+                <div style={{ fontSize: 16, fontWeight: 700, color: '#1e293b' }}>{isToday ? 'Today' : formatDate(selectedDate)}</div>
+                {!isToday && <div style={{ fontSize: 11, color: '#94a3b8' }}>{selectedDate}</div>}
+              </>
+            ) : (
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#1e293b' }}>
+                {screen === 'weight' ? 'Weight' : screen === 'settings' ? 'Settings' : screen}
+              </div>
+            )}
           </div>
+          {['dashboard', 'log', 'search'].includes(screen) ? (
           <button onClick={() => changeDate(1)} disabled={isToday} style={{
             width: 36, height: 36, borderRadius: 10, border: '1.5px solid #e2e8f0', backgroundColor: '#fff',
             cursor: isToday ? 'default' : 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center',
             color: isToday ? '#d1d5db' : '#64748b', opacity: isToday ? 0.5 : 1,
           }}>→</button>
+          ) : <div style={{ width: 36 }} />}
         </div>
       </div>
 
@@ -671,11 +692,30 @@ export default function App() {
                 </div>
               )}
               {!searching && searchQuery.length < 2 && (
-                <div style={{ padding: 20, textAlign: 'center' }}>
-                  <div style={{ fontSize: 32, marginBottom: 8 }}>🥗</div>
-                  <div style={{ fontSize: 14, color: '#94a3b8' }}>Search the Open Food Facts database</div>
-                  <div style={{ fontSize: 12, color: '#cbd5e1', marginTop: 4 }}>Over 4 million products from 150+ countries</div>
-                </div>
+                recentFoods.length > 0 ? (
+                  <>
+                    <div style={{ padding: '12px 16px 4px', fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.8 }}>Recent</div>
+                    {recentFoods.map((food, i) => (
+                      <FoodItem key={food.id || i} product={{
+                        code: food.id,
+                        product_name: food.name,
+                        brands: food.brand,
+                        nutriments: {
+                          'energy-kcal_100g': food.caloriesPer100,
+                          proteins_100g: food.proteinPer100,
+                          carbohydrates_100g: food.carbsPer100,
+                          fat_100g: food.fatPer100,
+                        },
+                      }} onAdd={f => setPortionFood(f)} />
+                    ))}
+                  </>
+                ) : (
+                  <div style={{ padding: 20, textAlign: 'center' }}>
+                    <div style={{ fontSize: 32, marginBottom: 8 }}>🥗</div>
+                    <div style={{ fontSize: 14, color: '#94a3b8' }}>Search the Open Food Facts database</div>
+                    <div style={{ fontSize: 12, color: '#cbd5e1', marginTop: 4 }}>Over 4 million UK products</div>
+                  </div>
+                )
               )}
               {searchResults.map((p, i) => (
                 <FoodItem key={p.code || i} product={p} onAdd={food => setPortionFood(food)} />
