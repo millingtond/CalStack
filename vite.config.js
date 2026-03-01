@@ -67,12 +67,11 @@ export default defineConfig({
           {
             // Cache Open Food Facts search results for 24h.
             urlPattern: /^https:\/\/.*openfoodfacts\.org\/.*/i,
-            handler: 'NetworkFirst',
+            handler: 'StaleWhileRevalidate',
             options: {
               cacheName: 'openfoodfacts-cache',
               expiration: { maxEntries: 100, maxAgeSeconds: 60 * 60 * 24 },
               cacheableResponse: { statuses: [0, 200] },
-              networkTimeoutSeconds: 5,
             },
           },
         ],

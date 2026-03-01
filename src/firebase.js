@@ -47,6 +47,19 @@ export const db = existingApp
       }),
     });
 export const auth = getAuth(app);
+const PENDING_REDIRECT_KEY = 'pending-auth-provider';
+
+export function subscribeToAuthChanges(callback) {
+  return onAuthStateChanged(auth, callback);
+}
+
+export function getPendingRedirectProvider() {
+  return sessionStorage.getItem(PENDING_REDIRECT_KEY);
+}
+
+export function clearPendingRedirectProvider() {
+  sessionStorage.removeItem(PENDING_REDIRECT_KEY);
+}
 
 /**
  * Redirect auth avoids popup blockers on mobile/PWA and avoids COOP popup
@@ -110,6 +123,7 @@ export async function signInWithApple() {
 async function _signInWithProvider(provider) {
   const user = auth.currentUser;
   if (shouldUseRedirectAuth()) {
+    sessionStorage.setItem(PENDING_REDIRECT_KEY, provider.providerId);
     // Redirect flow — page navigates away; handleRedirectResult() completes sign-in on return
     if (user?.isAnonymous) {
       await linkWithRedirect(user, provider);
@@ -141,13 +155,19 @@ async function _signInWithProvider(provider) {
 export async function handleRedirectResult() {
   try {
     const result = await getRedirectResult(auth);
-    return result?.user ?? null;
+    // Link redirects can complete by updating currentUser even when no credential is returned.
+    const user = result?.user ?? auth.currentUser ?? null;
+    if (user && !user.isAnonymous) clearPendingRedirectProvider();
+    return user;
   } catch (err) {
     if (err.code === 'auth/credential-already-in-use') {
       // The Google/Apple account already has a Firebase account — sign into it
-      return (await signInWithCredential(auth, err.credential)).user;
+      const user = (await signInWithCredential(auth, err.credential)).user;
+      clearPendingRedirectProvider();
+      return user;
     }
     if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
+      clearPendingRedirectProvider();
       return null; // User cancelled — treat as no-op
     }
     throw err;

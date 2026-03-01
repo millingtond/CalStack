@@ -10,6 +10,9 @@ import {
   signInWithGoogle, signInWithApple,
   signInWithEmail, createEmailAccount,
   sendMagicLink, completeMagicLinkSignIn,
+  getPendingRedirectProvider,
+  clearPendingRedirectProvider,
+  subscribeToAuthChanges,
   handleRedirectResult,
   signOutUser,
 } from './firebase';
@@ -17,6 +20,15 @@ import {
   MEALS, MEAL_ICONS, MEAL_LABELS, ACTIVITY_LEVELS, WEEKLY_GOALS,
   dateKey, formatDate, calcTDEE,
 } from './constants';
+
+const SEARCH_CACHE_STORAGE_KEY = 'calstack-search-cache-v1';
+const SEARCH_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const SEARCH_CACHE_MAX_ENTRIES = 24;
+const SEARCH_REMOTE_PAGE_SIZE = 12;
+const SEARCH_RESULT_LIMIT = 12;
+const LOCAL_SEARCH_RESULT_LIMIT = 6;
+const SEARCH_MIN_STRONG_MATCHES = 5;
+const SEARCH_STRONG_MATCH_THRESHOLD = 140;
 
 /* ─── Small UI components ────────────────────────────────────────────────── */
 
@@ -69,24 +81,391 @@ function MacroBar({ label, value, target, color, unit = 'g' }) {
   );
 }
 
-function FoodItem({ product, onAdd, onDelete }) {
+function toFiniteNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function formatMeasure(value) {
+  const num = toFiniteNumber(value);
+  if (num === null) return '';
+  return Number.isInteger(num) ? String(num) : num.toFixed(1).replace(/\.0$/, '');
+}
+
+function parseServingAmount(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+
+  const normalized = text.toLowerCase().replace(',', '.');
+  const match = normalized.match(/(\d+(?:\.\d+)?)\s*(g|gram|grams|ml)\b/);
+  if (!match) return null;
+
+  const quantity = toFiniteNumber(match[1]);
+  if (quantity === null || quantity <= 0) return null;
+
+  return { quantity, unit: match[2] };
+}
+
+function getServingText(product) {
+  if (typeof product.serving_size === 'string' && product.serving_size.trim()) return product.serving_size.trim();
+
+  const quantity = toFiniteNumber(product.serving_quantity);
+  if (quantity === null || quantity <= 0) return '';
+
+  const unit = typeof product.serving_quantity_unit === 'string' && product.serving_quantity_unit.trim()
+    ? product.serving_quantity_unit.trim()
+    : 'g';
+
+  return `${formatMeasure(quantity)}${unit}`;
+}
+
+function getServingGrams(product) {
+  const quantity = toFiniteNumber(product.serving_quantity);
+  if (quantity !== null && quantity > 0) {
+    const unit = typeof product.serving_quantity_unit === 'string' ? product.serving_quantity_unit.trim().toLowerCase() : '';
+    if (!unit || unit === 'g' || unit === 'gram' || unit === 'grams' || unit === 'ml') return quantity;
+  }
+
+  const parsedServing = parseServingAmount(product.serving_size);
+  if (parsedServing && ['g', 'gram', 'grams', 'ml'].includes(parsedServing.unit)) return parsedServing.quantity;
+
+  return null;
+}
+
+function normalizeSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function tokenizeSearchText(value) {
+  const normalized = normalizeSearchText(value);
+  return normalized ? normalized.split(' ') : [];
+}
+
+function getSearchName(item) {
+  return item.product_name || item.name || '';
+}
+
+function getSearchBrand(item) {
+  return item.brands || item.brand || '';
+}
+
+function hasSearchServingMeta(item) {
+  return Boolean(item.servingSizeLabel || getServingText(item) || toFiniteNumber(item.suggestedServingGrams) !== null || getServingGrams(item) !== null);
+}
+
+function isUkSearchItem(item) {
+  return Array.isArray(item.countries_tags) && item.countries_tags.includes('en:united-kingdom');
+}
+
+function scoreSearchItem(item, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) return 0;
+
+  const tokens = tokenizeSearchText(normalizedQuery);
+  const name = normalizeSearchText(getSearchName(item));
+  const brand = normalizeSearchText(getSearchBrand(item));
+  const combined = normalizeSearchText(`${brand} ${name}`);
+  const alternateCombined = normalizeSearchText(`${name} ${brand}`);
+
+  if (!combined) return 0;
+
+  let score = 0;
+
+  if (name === normalizedQuery) score += 420;
+  else if (combined === normalizedQuery || alternateCombined === normalizedQuery) score += 340;
+
+  if (name.startsWith(normalizedQuery)) score += 220;
+  else if (combined.startsWith(normalizedQuery) || alternateCombined.startsWith(normalizedQuery)) score += 180;
+
+  if (name.includes(normalizedQuery)) score += 140;
+  else if (combined.includes(normalizedQuery) || alternateCombined.includes(normalizedQuery)) score += 95;
+
+  let tokenMatches = 0;
+  let nameTokenMatches = 0;
+
+  tokens.forEach(token => {
+    if (name.includes(token)) {
+      tokenMatches += 1;
+      nameTokenMatches += 1;
+      score += 45;
+    } else if (brand.includes(token)) {
+      tokenMatches += 1;
+      score += 24;
+    }
+  });
+
+  if (tokens.length > 0 && nameTokenMatches === tokens.length) {
+    score += 130;
+  } else if (tokens.length > 0 && tokenMatches === tokens.length) {
+    score += 90;
+  }
+
+  if (tokens.length > 1) {
+    const phrase = tokens.join(' ');
+    if (combined.includes(phrase) || alternateCombined.includes(phrase)) score += 60;
+  }
+
+  if (hasSearchServingMeta(item)) score += 12;
+  if (isUkSearchItem(item)) score += 10;
+
+  return score;
+}
+
+function rankSearchItems(items, query, limit = SEARCH_RESULT_LIMIT) {
+  return items
+    .map((item, index) => ({ item, index, score: scoreSearchItem(item, query) }))
+    .filter(entry => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, limit)
+    .map(entry => entry.item);
+}
+
+function countStrongSearchMatches(items, query) {
+  return items.reduce((count, item) => count + (scoreSearchItem(item, query) >= SEARCH_STRONG_MATCH_THRESHOLD ? 1 : 0), 0);
+}
+
+function getSearchItemKey(item, fallback) {
+  if (item.code) return `code:${item.code}`;
+
+  const name = normalizeSearchText(getSearchName(item));
+  const brand = normalizeSearchText(getSearchBrand(item));
+
+  if (name || brand) return `name:${name}|${brand}`;
+  return `fallback:${fallback}`;
+}
+
+function mergeUniqueSearchItems(...groups) {
+  const merged = [];
+  const seen = new Set();
+
+  groups.forEach((items, groupIndex) => {
+    items.forEach((item, itemIndex) => {
+      const key = getSearchItemKey(item, `${groupIndex}-${itemIndex}`);
+      if (seen.has(key)) return;
+      seen.add(key);
+      merged.push(item);
+    });
+  });
+
+  return merged;
+}
+
+function trimSearchCache(cache) {
+  const entries = Object.entries(cache || {})
+    .filter(([, entry]) => entry && Array.isArray(entry.results) && toFiniteNumber(entry.timestamp) !== null)
+    .sort((a, b) => b[1].timestamp - a[1].timestamp)
+    .slice(0, SEARCH_CACHE_MAX_ENTRIES);
+
+  return Object.fromEntries(entries);
+}
+
+function trimAndPersistSearchCache(cache) {
+  const trimmed = trimSearchCache(cache);
+
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.setItem(SEARCH_CACHE_STORAGE_KEY, JSON.stringify(trimmed));
+    } catch {}
+  }
+
+  return trimmed;
+}
+
+function loadPersistedSearchCache() {
+  if (typeof window === 'undefined') return {};
+
+  try {
+    const raw = window.localStorage.getItem(SEARCH_CACHE_STORAGE_KEY);
+    if (!raw) return {};
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return {};
+
+    const now = Date.now();
+    const freshEntries = Object.fromEntries(
+      Object.entries(parsed).filter(([, entry]) => (
+        entry
+        && Array.isArray(entry.results)
+        && toFiniteNumber(entry.timestamp) !== null
+        && now - entry.timestamp <= SEARCH_CACHE_TTL_MS
+      )),
+    );
+
+    return trimSearchCache(freshEntries);
+  } catch {
+    return {};
+  }
+}
+
+function getFreshSearchCacheEntry(cache, key) {
+  const entry = cache[key];
+  if (!entry || !Array.isArray(entry.results) || toFiniteNumber(entry.timestamp) === null) return null;
+
+  if (Date.now() - entry.timestamp > SEARCH_CACHE_TTL_MS) {
+    const { [key]: _staleEntry, ...rest } = cache;
+    Object.keys(cache).forEach(existingKey => delete cache[existingKey]);
+    Object.assign(cache, trimAndPersistSearchCache(rest));
+    return null;
+  }
+
+  return entry;
+}
+
+function findPrefixSearchCacheEntry(cache, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) return null;
+
+  return Object.keys(cache)
+    .filter(cacheKey => cacheKey !== normalizedQuery && normalizedQuery.startsWith(cacheKey))
+    .sort((a, b) => b.length - a.length || cache[b].timestamp - cache[a].timestamp)
+    .map(cacheKey => getFreshSearchCacheEntry(cache, cacheKey))
+    .find(Boolean) || null;
+}
+
+function toFoodItemProduct(food) {
+  const product = {
+    code: food.id,
+    product_name: food.name,
+    brands: food.brand,
+    nutriments: {
+      'energy-kcal_100g': food.caloriesPer100,
+      proteins_100g: food.proteinPer100,
+      carbohydrates_100g: food.carbsPer100,
+      fat_100g: food.fatPer100,
+      fiber_100g: food.fibrePer100,
+      sugars_100g: food.sugarPer100,
+    },
+  };
+
+  if (food.servingSizeLabel) product.serving_size = food.servingSizeLabel;
+  if (food.suggestedServingGrams !== undefined) product.serving_quantity = food.suggestedServingGrams;
+
+  return product;
+}
+
+function toRecentFoodRecord(food) {
+  const record = {
+    id: food.id,
+    name: food.name,
+    brand: food.brand,
+    caloriesPer100: food.caloriesPer100,
+    proteinPer100: food.proteinPer100,
+    carbsPer100: food.carbsPer100,
+    fatPer100: food.fatPer100,
+    fibrePer100: food.fibrePer100,
+    sugarPer100: food.sugarPer100,
+  };
+
+  if (food.servingSizeLabel) record.servingSizeLabel = food.servingSizeLabel;
+  if (food.suggestedServingGrams !== undefined) record.suggestedServingGrams = food.suggestedServingGrams;
+
+  return record;
+}
+
+function getMatchingLocalFoods(foods, query, excludeIds = new Set(), limit = LOCAL_SEARCH_RESULT_LIMIT) {
+  return foods
+    .filter(food => !excludeIds.has(food.id))
+    .map((food, index) => ({ food, index, score: scoreSearchItem(food, query) }))
+    .filter(entry => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, limit)
+    .map(entry => entry.food);
+}
+
+function hasServingNutrition(nutriments) {
+  const servingKeys = [
+    'energy-kcal_serving',
+    'proteins_serving',
+    'carbohydrates_serving',
+    'fat_serving',
+    'fiber_serving',
+    'fibre_serving',
+    'sugars_serving',
+  ];
+
+  return servingKeys.some(key => toFiniteNumber(nutriments[key]) !== null);
+}
+
+function pickDisplayValue(nutriments, servingKeys, per100Keys, servingGrams, useServingValues) {
+  if (useServingValues) {
+    for (const key of servingKeys) {
+      const value = toFiniteNumber(nutriments[key]);
+      if (value !== null) return Math.round(value);
+    }
+
+    if (servingGrams !== null) {
+      for (const key of per100Keys) {
+        const value = toFiniteNumber(nutriments[key]);
+        if (value !== null) return Math.round((value * servingGrams) / 100);
+      }
+    }
+  }
+
+  for (const key of per100Keys) {
+    const value = toFiniteNumber(nutriments[key]);
+    if (value !== null) return Math.round(value);
+  }
+
+  return 0;
+}
+
+function getFoodDisplayMeta(product) {
+  const nutriments = product.nutriments || {};
+  const servingText = getServingText(product);
+  const servingGrams = getServingGrams(product);
+  const servingNutrition = hasServingNutrition(nutriments);
+  const useServingValues = (servingNutrition || servingGrams !== null) && (Boolean(servingText) || servingNutrition);
+
+  return {
+    servingText,
+    suggestedServingGrams: servingGrams,
+    basisLabel: useServingValues ? `per ${servingText || 'serving'}` : 'per 100g',
+    calories: pickDisplayValue(nutriments, ['energy-kcal_serving'], ['energy-kcal_100g', 'energy-kcal'], servingGrams, useServingValues),
+    protein: pickDisplayValue(nutriments, ['proteins_serving'], ['proteins_100g'], servingGrams, useServingValues),
+    carbs: pickDisplayValue(nutriments, ['carbohydrates_serving'], ['carbohydrates_100g'], servingGrams, useServingValues),
+    fat: pickDisplayValue(nutriments, ['fat_serving'], ['fat_100g'], servingGrams, useServingValues),
+    fibre: pickDisplayValue(nutriments, ['fiber_serving', 'fibre_serving'], ['fiber_100g', 'fibre_100g'], servingGrams, useServingValues),
+    sugar: pickDisplayValue(nutriments, ['sugars_serving'], ['sugars_100g'], servingGrams, useServingValues),
+  };
+}
+
+function mapProductToFood(product, fallbackId = Date.now().toString()) {
+  const n = product.nutriments || {};
+  const servingText = getServingText(product);
+  const suggestedServingGrams = getServingGrams(product);
+  const cal = Math.round(toFiniteNumber(n['energy-kcal_100g']) ?? toFiniteNumber(n['energy-kcal']) ?? 0);
+  const food = {
+    id: product.code || fallbackId,
+    name: product.product_name || 'Unknown Product',
+    brand: product.brands || '',
+    caloriesPer100: cal,
+    proteinPer100: toFiniteNumber(n.proteins_100g) ?? 0,
+    carbsPer100: toFiniteNumber(n.carbohydrates_100g) ?? 0,
+    fatPer100: toFiniteNumber(n.fat_100g) ?? 0,
+    fibrePer100: toFiniteNumber(n.fiber_100g) ?? toFiniteNumber(n.fibre_100g) ?? 0,
+    sugarPer100: toFiniteNumber(n.sugars_100g) ?? 0,
+  };
+
+  if (servingText) food.servingSizeLabel = servingText;
+  if (suggestedServingGrams !== null) food.suggestedServingGrams = suggestedServingGrams;
+
+  return food;
+}
+
+function FoodItem({ product, onAdd, onDelete, onEdit }) {
   const name = product.product_name || 'Unknown Product';
   const brand = product.brands || '';
-  const n = product.nutriments || {};
-  const cal = Math.round(n['energy-kcal_100g'] || n['energy-kcal'] || 0);
+  const display = getFoodDisplayMeta(product);
+  const food = mapProductToFood(product);
 
   return (
     <div
-      onClick={() => onAdd({
-        id: product.code || Date.now().toString(),
-        name, brand,
-        caloriesPer100: cal,
-        proteinPer100: n.proteins_100g || 0,
-        carbsPer100: n.carbohydrates_100g || 0,
-        fatPer100: n.fat_100g || 0,
-        fibrePer100: n.fiber_100g || n['fiber_100g'] || 0,
-        sugarPer100: n.sugars_100g || 0,
-      })}
+      onClick={() => onAdd(food)}
       style={{ padding: '14px 16px', cursor: 'pointer', borderBottom: '1px solid rgba(0,0,0,0.05)', transition: 'background-color 0.15s ease' }}
       onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'rgba(0,0,0,0.02)')}
       onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
@@ -97,17 +476,18 @@ function FoodItem({ product, onAdd, onDelete }) {
           {brand && <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 2 }}>{brand}</div>}
         </div>
         <div className="flex items-center gap-2">
-          <div style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>{cal} kcal</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: '#f97316' }}>{display.calories} kcal</div>
+          {onEdit && <button onClick={e => { e.stopPropagation(); onEdit(); }} style={{ width: 20, height: 20, borderRadius: 5, border: 'none', backgroundColor: 'rgba(249,115,22,0.12)', color: '#f97316', fontSize: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✎</button>}
           {onDelete && <button onClick={e => { e.stopPropagation(); onDelete(); }} style={{ width: 20, height: 20, borderRadius: 5, border: 'none', backgroundColor: 'rgba(239,68,68,0.1)', color: '#ef4444', fontSize: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✕</button>}
         </div>
       </div>
       <div className="flex gap-3 mt-2" style={{ flexWrap: 'wrap' }}>
-        <span style={{ fontSize: 11, color: '#64748b' }}>P: {Math.round(n.proteins_100g || 0)}g</span>
-        <span style={{ fontSize: 11, color: '#64748b' }}>C: {Math.round(n.carbohydrates_100g || 0)}g</span>
-        <span style={{ fontSize: 11, color: '#64748b' }}>F: {Math.round(n.fat_100g || 0)}g</span>
-        {(n.fiber_100g || n['fiber_100g']) ? <span style={{ fontSize: 11, color: '#64748b' }}>Fi: {Math.round(n.fiber_100g || n['fiber_100g'] || 0)}g</span> : null}
-        {n.sugars_100g ? <span style={{ fontSize: 11, color: '#64748b' }}>S: {Math.round(n.sugars_100g || 0)}g</span> : null}
-        <span style={{ fontSize: 11, color: '#94a3b8' }}>per 100g</span>
+        <span style={{ fontSize: 11, color: '#64748b' }}>P: {display.protein}g</span>
+        <span style={{ fontSize: 11, color: '#64748b' }}>C: {display.carbs}g</span>
+        <span style={{ fontSize: 11, color: '#64748b' }}>F: {display.fat}g</span>
+        {display.fibre > 0 ? <span style={{ fontSize: 11, color: '#64748b' }}>Fi: {display.fibre}g</span> : null}
+        {display.sugar > 0 ? <span style={{ fontSize: 11, color: '#64748b' }}>S: {display.sugar}g</span> : null}
+        <span style={{ fontSize: 11, color: '#94a3b8' }}>{display.basisLabel}</span>
       </div>
     </div>
   );
@@ -115,13 +495,17 @@ function FoodItem({ product, onAdd, onDelete }) {
 
 /* ─── Modals ─────────────────────────────────────────────────────────────── */
 
-function PortionModal({ food, meal, onConfirm, onClose }) {
-  const [grams, setGrams] = useState('100');
+function PortionModal({ food, meal, onConfirm, onClose, initialGrams, confirmLabel }) {
+  const defaultGrams = initialGrams ?? food.grams ?? food.suggestedServingGrams ?? 100;
+  const [grams, setGrams] = useState(() => formatMeasure(defaultGrams) || '100');
+  useEffect(() => {
+    setGrams(formatMeasure(initialGrams ?? food.grams ?? food.suggestedServingGrams ?? 100) || '100');
+  }, [food, initialGrams]);
   const g = parseFloat(grams) || 0;
   const mult = g / 100;
 
   const entry = {
-    ...food, grams: g, meal, timestamp: Date.now(),
+    ...food, grams: g, meal, timestamp: food.timestamp || Date.now(),
     calories: Math.round(food.caloriesPer100 * mult),
     protein: +(food.proteinPer100 * mult).toFixed(1),
     carbs: +(food.carbsPer100 * mult).toFixed(1),
@@ -142,6 +526,9 @@ function PortionModal({ food, meal, onConfirm, onClose }) {
         {food.brand && <div style={{ fontSize: 13, color: '#94a3b8', marginBottom: 16 }}>{food.brand}</div>}
 
         <label style={{ fontSize: 13, fontWeight: 600, color: '#64748b', display: 'block', marginBottom: 6 }}>Serving size (grams)</label>
+        {food.servingSizeLabel && (
+          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Suggested portion: {food.servingSizeLabel}</div>
+        )}
         <div className="flex gap-2 mb-4">
           <input type="number" value={grams} onChange={e => setGrams(e.target.value)} autoFocus style={inputStyle}
             onFocus={e => (e.target.style.borderColor = '#f97316')} onBlur={e => (e.target.style.borderColor = '#e2e8f0')} />
@@ -177,24 +564,34 @@ function PortionModal({ food, meal, onConfirm, onClose }) {
 
         <div className="flex gap-3">
           <button onClick={onClose} style={{ flex: 1, padding: 14, borderRadius: 14, fontSize: 15, fontWeight: 600, border: '2px solid #e2e8f0', backgroundColor: '#fff', color: '#64748b', cursor: 'pointer' }}>Cancel</button>
-          <button onClick={() => onConfirm(entry)} style={{ flex: 2, padding: 14, borderRadius: 14, fontSize: 15, fontWeight: 700, border: 'none', backgroundColor: '#f97316', color: '#fff', cursor: 'pointer', boxShadow: '0 4px 14px rgba(249,115,22,0.3)' }}>Add to {MEAL_LABELS[meal]}</button>
+          <button onClick={() => onConfirm(entry)} style={{ flex: 2, padding: 14, borderRadius: 14, fontSize: 15, fontWeight: 700, border: 'none', backgroundColor: '#f97316', color: '#fff', cursor: 'pointer', boxShadow: '0 4px 14px rgba(249,115,22,0.3)' }}>{confirmLabel || `Add to ${MEAL_LABELS[meal]}`}</button>
         </div>
       </div>
     </div>
   );
 }
 
-function QuickAddModal({ meal, onConfirm, onClose }) {
-  const [name, setName] = useState('');
-  const [calories, setCalories] = useState('');
-  const [protein, setProtein] = useState('');
-  const [carbs, setCarbs] = useState('');
-  const [fat, setFat] = useState('');
+function QuickAddModal({ meal, onConfirm, onClose, initialEntry, submitLabel }) {
+  const [name, setName] = useState(initialEntry?.name || '');
+  const [calories, setCalories] = useState(initialEntry?.calories !== undefined ? String(initialEntry.calories) : '');
+  const [protein, setProtein] = useState(initialEntry?.protein !== undefined ? String(initialEntry.protein) : '');
+  const [carbs, setCarbs] = useState(initialEntry?.carbs !== undefined ? String(initialEntry.carbs) : '');
+  const [fat, setFat] = useState(initialEntry?.fat !== undefined ? String(initialEntry.fat) : '');
+
+  useEffect(() => {
+    setName(initialEntry?.name || '');
+    setCalories(initialEntry?.calories !== undefined ? String(initialEntry.calories) : '');
+    setProtein(initialEntry?.protein !== undefined ? String(initialEntry.protein) : '');
+    setCarbs(initialEntry?.carbs !== undefined ? String(initialEntry.carbs) : '');
+    setFat(initialEntry?.fat !== undefined ? String(initialEntry.fat) : '');
+  }, [initialEntry]);
 
   const handleSubmit = () => {
     if (!name || !calories) return;
+    const base = initialEntry || {};
     onConfirm({
-      id: Date.now().toString(), name, brand: 'Quick add', grams: 0, meal, timestamp: Date.now(),
+      ...base,
+      id: base.id || Date.now().toString(), name, brand: 'Quick add', grams: 0, meal, timestamp: base.timestamp || Date.now(),
       calories: parseInt(calories) || 0, protein: parseFloat(protein) || 0,
       carbs: parseFloat(carbs) || 0, fat: parseFloat(fat) || 0,
     });
@@ -208,7 +605,7 @@ function QuickAddModal({ meal, onConfirm, onClose }) {
   return (
     <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 1000, padding: 16 }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 420, backgroundColor: '#fff', borderRadius: 20, padding: 24, boxShadow: '0 -8px 40px rgba(0,0,0,0.15)' }}>
-        <div style={{ fontSize: 18, fontWeight: 700, color: '#1e293b', marginBottom: 16 }}>Quick Add to {MEAL_LABELS[meal]}</div>
+        <div style={{ fontSize: 18, fontWeight: 700, color: '#1e293b', marginBottom: 16 }}>{submitLabel ? 'Edit Entry' : `Quick Add to ${MEAL_LABELS[meal]}`}</div>
         <div className="flex flex-col gap-3 mb-5">
           <input placeholder="Food name *" value={name} onChange={e => setName(e.target.value)} style={inputStyle} autoFocus
             onFocus={e => (e.target.style.borderColor = '#f97316')} onBlur={e => (e.target.style.borderColor = '#e2e8f0')} />
@@ -228,7 +625,7 @@ function QuickAddModal({ meal, onConfirm, onClose }) {
           <button onClick={handleSubmit} style={{
             flex: 2, padding: 14, borderRadius: 14, fontSize: 15, fontWeight: 700, border: 'none', backgroundColor: '#f97316',
             color: '#fff', cursor: 'pointer', opacity: (!name || !calories) ? 0.5 : 1, boxShadow: '0 4px 14px rgba(249,115,22,0.3)',
-          }}>Add Entry</button>
+          }}>{submitLabel || 'Add Entry'}</button>
         </div>
       </div>
     </div>
@@ -452,18 +849,40 @@ function ExerciseModal({ onConfirm, onClose }) {
 
 /* ─── Custom Food Modal ──────────────────────────────────────────────────── */
 
-function CustomFoodModal({ onSave, onClose }) {
-  const [form, setForm] = useState({ name: '', brand: '', calories: '', protein: '', carbs: '', fat: '', fibre: '', sugar: '' });
+function CustomFoodModal({ food, onSave, onClose }) {
+  const [form, setForm] = useState({
+    name: food?.name || '',
+    brand: food?.brand || '',
+    calories: food?.caloriesPer100 !== undefined ? String(food.caloriesPer100) : '',
+    protein: food?.proteinPer100 !== undefined ? String(food.proteinPer100) : '',
+    carbs: food?.carbsPer100 !== undefined ? String(food.carbsPer100) : '',
+    fat: food?.fatPer100 !== undefined ? String(food.fatPer100) : '',
+    fibre: food?.fibrePer100 !== undefined ? String(food.fibrePer100) : '',
+    sugar: food?.sugarPer100 !== undefined ? String(food.sugarPer100) : '',
+  });
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const inputStyle = { width: '100%', padding: '10px 14px', fontSize: 14, borderRadius: 12, border: '2px solid #e2e8f0', outline: 'none', boxSizing: 'border-box' };
   const focus = e => (e.target.style.borderColor = '#f97316');
   const blur = e => (e.target.style.borderColor = '#e2e8f0');
   const valid = form.name.trim() && form.calories;
 
+  useEffect(() => {
+    setForm({
+      name: food?.name || '',
+      brand: food?.brand || '',
+      calories: food?.caloriesPer100 !== undefined ? String(food.caloriesPer100) : '',
+      protein: food?.proteinPer100 !== undefined ? String(food.proteinPer100) : '',
+      carbs: food?.carbsPer100 !== undefined ? String(food.carbsPer100) : '',
+      fat: food?.fatPer100 !== undefined ? String(food.fatPer100) : '',
+      fibre: food?.fibrePer100 !== undefined ? String(food.fibrePer100) : '',
+      sugar: food?.sugarPer100 !== undefined ? String(food.sugarPer100) : '',
+    });
+  }, [food]);
+
   return (
     <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 1000, padding: 16 }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 420, backgroundColor: '#fff', borderRadius: 20, padding: 24, boxShadow: '0 -8px 40px rgba(0,0,0,0.15)', maxHeight: '85vh', overflowY: 'auto' }}>
-        <div style={{ fontSize: 18, fontWeight: 700, color: '#1e293b', marginBottom: 4 }}>Create Custom Food</div>
+        <div style={{ fontSize: 18, fontWeight: 700, color: '#1e293b', marginBottom: 4 }}>{food ? 'Edit Custom Food' : 'Create Custom Food'}</div>
         <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 16 }}>All values per 100g</div>
         <div className="flex flex-col gap-3 mb-5">
           {[
@@ -485,13 +904,14 @@ function CustomFoodModal({ onSave, onClose }) {
         <div className="flex gap-3">
           <button onClick={onClose} style={{ flex: 1, padding: 14, borderRadius: 14, fontSize: 15, fontWeight: 600, border: '2px solid #e2e8f0', backgroundColor: '#fff', color: '#64748b', cursor: 'pointer' }}>Cancel</button>
           <button onClick={() => valid && onSave({
-            id: `custom-${Date.now()}`, name: form.name.trim(), brand: form.brand.trim(),
+            ...(food || {}),
+            id: food?.id || `custom-${Date.now()}`, name: form.name.trim(), brand: form.brand.trim(),
             caloriesPer100: parseFloat(form.calories) || 0, proteinPer100: parseFloat(form.protein) || 0,
             carbsPer100: parseFloat(form.carbs) || 0, fatPer100: parseFloat(form.fat) || 0,
             fibrePer100: parseFloat(form.fibre) || 0, sugarPer100: parseFloat(form.sugar) || 0,
             isCustom: true,
           })} style={{ flex: 2, padding: 14, borderRadius: 14, fontSize: 15, fontWeight: 700, border: 'none', backgroundColor: '#f97316', color: '#fff', cursor: 'pointer', opacity: valid ? 1 : 0.5 }}>
-            Save Food
+            {food ? 'Save Changes' : 'Save Food'}
           </button>
         </div>
       </div>
@@ -548,7 +968,7 @@ function SavedMealsModal({ savedMeals, onLoad, onDelete, onClose }) {
 
 /* ─── Onboarding ─────────────────────────────────────────────────────────── */
 
-function Onboarding({ currentUser, onComplete, onSignIn }) {
+function Onboarding({ currentUser, authNotice, onComplete, onSignIn }) {
   const [step, setStep] = useState(0);
   const [profile, setProfile] = useState({
     name: currentUser?.displayName || '', gender: 'male', age: 30, heightCm: 175, weightKg: 80,
@@ -587,6 +1007,11 @@ function Onboarding({ currentUser, onComplete, onSignIn }) {
       <p style={{ fontSize: 15, color: '#94a3b8', marginBottom: 32, lineHeight: 1.5 }}>
         We'll calculate your daily calorie target based on a few details about you. Your data syncs automatically via Firebase.
       </p>
+      {authNotice && (
+        <div style={{ fontSize: 13, lineHeight: 1.5, color: '#9a3412', backgroundColor: '#fff7ed', border: '1px solid #fdba74', borderRadius: 12, padding: '12px 14px', marginBottom: 16 }}>
+          {authNotice}
+        </div>
+      )}
       {isSignedIn && (
         <div style={{ fontSize: 13, fontWeight: 600, color: '#047857', marginBottom: 16 }}>
           Signed in as {currentUser.displayName || currentUser.email || 'your account'}. Finish setup to start syncing.
@@ -697,7 +1122,7 @@ function Onboarding({ currentUser, onComplete, onSignIn }) {
       </div>
       {showSignIn && (
         <AuthModal
-          currentUser={null}
+          currentUser={currentUser}
           onSuccess={(user) => { setShowSignIn(false); onSignIn(user); }}
           onClose={() => setShowSignIn(false)}
         />
@@ -912,6 +1337,7 @@ export default function App() {
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(true);
   const [screen, setScreen] = useState('dashboard');
+  const [authNotice, setAuthNotice] = useState('');
   const [selectedDate, setSelectedDate] = useState(dateKey());
   const [dayLog, setDayLog] = useState({ breakfast: [], lunch: [], dinner: [], snacks: [], water: 0, exercises: [] });
   const [weightHistory, setWeightHistory] = useState([]);
@@ -925,16 +1351,21 @@ export default function App() {
   const [quickAddMeal, setQuickAddMeal] = useState(null);
   const searchTimer = useRef(null);
   const searchAbort = useRef(null);
-  const searchCache = useRef({});
+  const searchCache = useRef(null);
+  if (searchCache.current === null) searchCache.current = loadPersistedSearchCache();
+  const activeUidRef = useRef(null);
+  const authInitDoneRef = useRef(false);
   const [recentFoods, setRecentFoods] = useState([]);
   const [showScanner, setShowScanner] = useState(false);
   const [barcodeLoading, setBarcodeLoading] = useState(false);
   const [showExerciseModal, setShowExerciseModal] = useState(false);
   const [customFoods, setCustomFoods] = useState([]);
   const [showCustomFoodModal, setShowCustomFoodModal] = useState(false);
+  const [editingCustomFood, setEditingCustomFood] = useState(null);
   const [savedMeals, setSavedMeals] = useState([]);
   const [saveMealTarget, setSaveMealTarget] = useState(null); // { meal, label }
   const [loadMealTarget, setLoadMealTarget] = useState(null); // meal key
+  const [editingFoodTarget, setEditingFoodTarget] = useState(null);
 
   const [newWeight, setNewWeight] = useState('');
   const [statsTab, setStatsTab] = useState('weight');
@@ -942,8 +1373,14 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [showAuthModal, setShowAuthModal] = useState(false);
 
+  const closeCustomFoodModal = () => {
+    setEditingCustomFood(null);
+    setShowCustomFoodModal(false);
+  };
+
   // ── Load data for a given uid ──
   const loadUserData = useCallback(async (uid) => {
+    activeUidRef.current = uid;
     setUid(uid);
     const p = await load('profile', null);
     if (p) {
@@ -973,18 +1410,35 @@ export default function App() {
 
   // ── Load initial data ──
   useEffect(() => {
+    const unsubscribe = subscribeToAuthChanges(async (user) => {
+      setCurrentUser(user);
+
+      if (user && !user.isAnonymous) {
+        clearPendingRedirectProvider();
+        setAuthNotice('');
+      }
+
+      // Ignore the initial auth callback until the bootstrap flow picks a user.
+      if (!authInitDoneRef.current || !user) return;
+      if (user.uid === activeUidRef.current) return;
+
+      await loadUserData(user.uid);
+    });
+
+    return unsubscribe;
+  }, [loadUserData]);
+
+  useEffect(() => {
     (async () => {
       try {
-        let activeUid = await waitForAuth({ allowAnonymous: false });
-        let activeUser = auth.currentUser;
+        let activeUid = null;
+        let activeUser = null;
+        const pendingRedirectProvider = getPendingRedirectProvider();
 
         // Handle return from Google/Apple redirect sign-in (mobile/PWA)
         try {
-          const redirectUser = await handleRedirectResult();
-          if (redirectUser) {
-            activeUser = redirectUser;
-            activeUid = redirectUser.uid;
-          }
+          activeUser = await handleRedirectResult();
+          activeUid = activeUser?.uid ?? null;
         } catch (e) {
           console.warn('Redirect sign-in failed:', e);
         }
@@ -1000,17 +1454,38 @@ export default function App() {
           console.warn('Magic link sign-in failed:', e);
         }
 
+        if (!activeUser && auth.currentUser) {
+          activeUser = auth.currentUser;
+          activeUid = auth.currentUser.uid;
+        }
+
+        if (!activeUid) {
+          activeUid = await waitForAuth({ allowAnonymous: false });
+          activeUser = auth.currentUser;
+        }
+
         if (!activeUid) {
           activeUid = await waitForAuth();
           activeUser = auth.currentUser;
+        }
+
+        if (activeUser && !activeUser.isAnonymous) {
+          clearPendingRedirectProvider();
+          setAuthNotice('');
+        } else if (pendingRedirectProvider) {
+          const providerName = pendingRedirectProvider === 'google.com' ? 'Google' : 'Apple';
+          setAuthNotice(`${providerName} sign-in returned, but Firebase kept this session as a guest account. On localhost this is usually caused by redirect auth being blocked by browser storage rules. Retry sign-in now that local development uses a popup again.`);
+          clearPendingRedirectProvider();
         }
 
         setCurrentUser(activeUser);
         await loadUserData(activeUid);
       } catch (e) {
         console.error('Init error:', e);
+      } finally {
+        authInitDoneRef.current = true;
+        setLoading(false);
       }
-      setLoading(false);
     })();
   }, [loadUserData]);
 
@@ -1040,9 +1515,8 @@ export default function App() {
     const newLog = { ...dayLog, [entry.meal]: [...(dayLog[entry.meal] || []), entry] };
     await saveDayLog(newLog);
     if (entry.brand !== 'Quick add' && entry.caloriesPer100) {
-      const { id, name, brand, caloriesPer100, proteinPer100, carbsPer100, fatPer100 } = entry;
-      const foodRecord = { id, name, brand, caloriesPer100, proteinPer100, carbsPer100, fatPer100 };
-      const updated = [foodRecord, ...recentFoods.filter(f => f.id !== id)].slice(0, 20);
+      const foodRecord = toRecentFoodRecord(entry);
+      const updated = [foodRecord, ...recentFoods.filter(f => f.id !== entry.id)].slice(0, 20);
       setRecentFoods(updated);
       await save('recent-foods', updated);
     }
@@ -1054,6 +1528,31 @@ export default function App() {
 
   const removeFoodEntry = async (meal, index) => {
     await saveDayLog({ ...dayLog, [meal]: dayLog[meal].filter((_, i) => i !== index) });
+  };
+
+  const updateFoodEntry = async (meal, index, updatedEntry) => {
+    const existingEntry = dayLog[meal]?.[index];
+    if (!existingEntry) return;
+
+    const nextEntry = {
+      ...updatedEntry,
+      meal,
+      timestamp: existingEntry.timestamp || updatedEntry.timestamp || Date.now(),
+    };
+
+    await saveDayLog({
+      ...dayLog,
+      [meal]: dayLog[meal].map((entry, i) => (i === index ? nextEntry : entry)),
+    });
+
+    if (nextEntry.brand !== 'Quick add' && nextEntry.caloriesPer100) {
+      const foodRecord = toRecentFoodRecord(nextEntry);
+      const updated = [foodRecord, ...recentFoods.filter(f => f.id !== nextEntry.id)].slice(0, 20);
+      setRecentFoods(updated);
+      await save('recent-foods', updated);
+    }
+
+    setEditingFoodTarget(null);
   };
 
   // ── Exercise ──
@@ -1097,20 +1596,10 @@ export default function App() {
       const data = await res.json();
       if (data.status === 1 && data.product) {
         const p = data.product;
-        const n = p.nutriments || {};
-        const cal = Math.round(n['energy-kcal_100g'] || n['energy-kcal'] || 0);
+        const food = mapProductToFood({ ...p, code });
+        const cal = food.caloriesPer100;
         if (cal > 0) {
-          setPortionFood({
-            id: code,
-            name: p.product_name || 'Unknown Product',
-            brand: p.brands || '',
-            caloriesPer100: cal,
-            proteinPer100: n.proteins_100g || 0,
-            carbsPer100: n.carbohydrates_100g || 0,
-            fatPer100: n.fat_100g || 0,
-            fibrePer100: n.fiber_100g || 0,
-            sugarPer100: n.sugars_100g || 0,
-          });
+          setPortionFood(food);
         } else {
           alert('Product found but has no calorie data.');
         }
@@ -1125,17 +1614,30 @@ export default function App() {
 
   // ── Custom Foods ──
   const saveCustomFood = async (food) => {
-    const updated = [food, ...customFoods];
+    const isEditing = customFoods.some(f => f.id === food.id);
+    const updated = [food, ...customFoods.filter(f => f.id !== food.id)];
     setCustomFoods(updated);
     await save('custom-foods', updated);
-    setShowCustomFoodModal(false);
-    setPortionFood(food);
+
+    const foodRecord = toRecentFoodRecord(food);
+    const updatedRecent = [foodRecord, ...recentFoods.filter(f => f.id !== food.id)].slice(0, 20);
+    setRecentFoods(updatedRecent);
+    await save('recent-foods', updatedRecent);
+
+    closeCustomFoodModal();
+    if (!isEditing) setPortionFood(food);
   };
 
   const deleteCustomFood = async (id) => {
     const updated = customFoods.filter(f => f.id !== id);
     setCustomFoods(updated);
     await save('custom-foods', updated);
+
+    const updatedRecent = recentFoods.filter(f => f.id !== id);
+    setRecentFoods(updatedRecent);
+    await save('recent-foods', updatedRecent);
+
+    if (editingCustomFood?.id === id) closeCustomFoodModal();
   };
 
   // ── Saved Meals ──
@@ -1164,7 +1666,7 @@ export default function App() {
   // ── Food search via Open Food Facts ──
   const searchFood = useCallback(async (query) => {
     const normalizedQuery = query.trim();
-    const cacheKey = normalizedQuery.toLowerCase();
+    const cacheKey = normalizeSearchText(normalizedQuery);
 
     if (!normalizedQuery || normalizedQuery.length < 2) {
       if (searchAbort.current) {
@@ -1176,11 +1678,16 @@ export default function App() {
       return;
     }
 
-    // Return cached result instantly
-    if (searchCache.current[cacheKey]) {
+    const cachedEntry = getFreshSearchCacheEntry(searchCache.current, cacheKey);
+    if (cachedEntry) {
       setSearching(false);
-      setSearchResults(searchCache.current[cacheKey]);
+      setSearchResults(rankSearchItems(cachedEntry.results, normalizedQuery, SEARCH_RESULT_LIMIT));
       return;
+    }
+
+    const prefixCacheEntry = findPrefixSearchCacheEntry(searchCache.current, cacheKey);
+    if (prefixCacheEntry) {
+      setSearchResults(rankSearchItems(prefixCacheEntry.results, normalizedQuery, SEARCH_RESULT_LIMIT));
     }
 
     // Cancel any in-flight request
@@ -1190,24 +1697,33 @@ export default function App() {
 
     setSearching(true);
     try {
-      const base = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(normalizedQuery)}&json=1&page_size=20&fields=code,product_name,brands,nutriments,image_small_url`;
+      const base = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(normalizedQuery)}&json=1&page_size=${SEARCH_REMOTE_PAGE_SIZE}&fields=code,product_name,brands,nutriments,serving_size,serving_quantity,serving_quantity_unit,countries_tags`;
       const filterValid = p => p.product_name && p.nutriments && (p.nutriments['energy-kcal_100g'] || p.nutriments['energy-kcal']);
 
       // Try UK-filtered first
       const ukRes = await fetch(`${base}&tagtype_0=countries&tag_contains_0=contains&tag_0=en:united-kingdom`, { signal: controller.signal });
       const ukData = await ukRes.json();
-      let results = (ukData.products || []).filter(filterValid);
+      const ukResults = (ukData.products || []).filter(filterValid);
+      const strongUkMatches = countStrongSearchMatches(ukResults, normalizedQuery);
+      let mergedResults = ukResults;
 
-      // Fall back to global if UK returns nothing
-      if (results.length === 0) {
+      // Broaden results if UK matches are thin or weak.
+      if (ukResults.length < SEARCH_MIN_STRONG_MATCHES || strongUkMatches < SEARCH_MIN_STRONG_MATCHES) {
         const worldRes = await fetch(base, { signal: controller.signal });
         const worldData = await worldRes.json();
-        results = (worldData.products || []).filter(filterValid);
+        const worldResults = (worldData.products || []).filter(filterValid);
+        mergedResults = mergeUniqueSearchItems(ukResults, worldResults);
       }
 
+      const rankedResults = rankSearchItems(mergedResults, normalizedQuery, SEARCH_CACHE_MAX_ENTRIES);
+      const visibleResults = rankedResults.slice(0, SEARCH_RESULT_LIMIT);
+
       if (searchAbort.current === controller) {
-        searchCache.current[cacheKey] = results;
-        setSearchResults(results);
+        searchCache.current = trimAndPersistSearchCache({
+          ...searchCache.current,
+          [cacheKey]: { results: rankedResults, timestamp: Date.now() },
+        });
+        setSearchResults(visibleResults);
       }
     } catch (e) {
       if (e.name !== 'AbortError' && searchAbort.current === controller) setSearchResults([]);
@@ -1222,13 +1738,26 @@ export default function App() {
   const handleSearchInput = (val) => {
     setSearchQuery(val);
     clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => searchFood(val), 300);
+    const delay = val.trim().length >= 3 ? 180 : 300;
+    searchTimer.current = setTimeout(() => searchFood(val), delay);
+  };
+
+  const triggerSearchNow = (query = searchQuery) => {
+    clearTimeout(searchTimer.current);
+    searchFood(query);
   };
 
   useEffect(() => () => {
     clearTimeout(searchTimer.current);
     if (searchAbort.current) searchAbort.current.abort();
   }, []);
+
+  const hasActiveSearchQuery = searchQuery.trim().length >= 2;
+  const matchedCustomFoods = hasActiveSearchQuery ? getMatchingLocalFoods(customFoods, searchQuery) : [];
+  const matchedCustomIds = new Set(matchedCustomFoods.map(food => food.id));
+  const matchedRecentFoods = hasActiveSearchQuery ? getMatchingLocalFoods(recentFoods, searchQuery, matchedCustomIds) : [];
+  const hasLocalSearchMatches = matchedCustomFoods.length > 0 || matchedRecentFoods.length > 0;
+  const editingFoodEntry = editingFoodTarget ? dayLog[editingFoodTarget.meal]?.[editingFoodTarget.index] : null;
 
   // ── Calculations ──
   const totals = MEALS.reduce((acc, meal) => {
@@ -1343,7 +1872,7 @@ export default function App() {
     );
   }
 
-  if (!profile) return <Onboarding currentUser={currentUser} onComplete={p => { setProfile(p); setScreen('dashboard'); }} onSignIn={handleAuthSuccess} />;
+  if (!profile) return <Onboarding currentUser={currentUser} authNotice={authNotice} onComplete={p => { setProfile(p); setScreen('dashboard'); }} onSignIn={handleAuthSuccess} />;
 
   const navItems = [
     { id: 'dashboard', icon: '◉', label: 'Today' },
@@ -1557,6 +2086,10 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-2" style={{ flexShrink: 0, marginLeft: 8 }}>
                       <span style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>{entry.calories}</span>
+                      <button onClick={() => setEditingFoodTarget({ meal, index: idx })} style={{
+                        width: 24, height: 24, borderRadius: 6, border: 'none', backgroundColor: 'rgba(249,115,22,0.12)',
+                        cursor: 'pointer', fontSize: 12, color: '#f97316', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}>✎</button>
                       <button onClick={() => removeFoodEntry(meal, idx)} style={{
                         width: 24, height: 24, borderRadius: 6, border: 'none', backgroundColor: 'rgba(239,68,68,0.08)',
                         cursor: 'pointer', fontSize: 12, color: '#ef4444', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1624,6 +2157,12 @@ export default function App() {
                   width: '100%', padding: '14px 48px 14px 42px', fontSize: 15, borderRadius: 14,
                   border: '2px solid #e2e8f0', outline: 'none', backgroundColor: '#fff', boxSizing: 'border-box',
                 }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    triggerSearchNow(e.currentTarget.value);
+                  }
+                }}
                 onFocus={e => (e.target.style.borderColor = '#f97316')} onBlur={e => (e.target.style.borderColor = '#e2e8f0')}
               />
               <span style={{ position: 'absolute', left: 14, top: '50%', transform: 'translateY(-50%)', fontSize: 18, color: '#94a3b8' }}>🔍</span>
@@ -1639,18 +2178,18 @@ export default function App() {
             <div className="flex gap-2 mb-3">
               <button onClick={() => setQuickAddMeal(searchMeal)} style={{ flex: 1, padding: 12, borderRadius: 12, fontSize: 13, fontWeight: 600, border: '2px dashed #e2e8f0', backgroundColor: '#fff', color: '#64748b', cursor: 'pointer' }}>✏️ Quick add</button>
               <button onClick={() => setShowScanner(true)} style={{ flex: 1, padding: 12, borderRadius: 12, fontSize: 13, fontWeight: 600, border: '2px dashed #e2e8f0', backgroundColor: '#fff', color: '#64748b', cursor: 'pointer' }}>⬛ Scan barcode</button>
-              <button onClick={() => setShowCustomFoodModal(true)} style={{ flex: 1, padding: 12, borderRadius: 12, fontSize: 13, fontWeight: 600, border: '2px dashed #e2e8f0', backgroundColor: '#fff', color: '#64748b', cursor: 'pointer' }}>＋ Create food</button>
+              <button onClick={() => { setEditingCustomFood(null); setShowCustomFoodModal(true); }} style={{ flex: 1, padding: 12, borderRadius: 12, fontSize: 13, fontWeight: 600, border: '2px dashed #e2e8f0', backgroundColor: '#fff', color: '#64748b', cursor: 'pointer' }}>＋ Create food</button>
             </div>
 
             <div style={{ backgroundColor: '#fff', borderRadius: 16, overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
               {searching && <div style={{ padding: 20, textAlign: 'center', color: '#94a3b8', fontSize: 14 }}>Searching...</div>}
-              {!searching && searchQuery.length >= 2 && searchResults.length === 0 && (
+              {!searching && hasActiveSearchQuery && !hasLocalSearchMatches && searchResults.length === 0 && (
                 <div style={{ padding: 20, textAlign: 'center' }}>
                   <div style={{ fontSize: 13, color: '#94a3b8' }}>No results for "{searchQuery}"</div>
                   <div style={{ fontSize: 12, color: '#cbd5e1', marginTop: 4 }}>Try a different term or create a custom food</div>
                 </div>
               )}
-              {!searching && searchQuery.length < 2 && (() => {
+              {!searching && !hasActiveSearchQuery && (() => {
                 const filteredCustom = customFoods;
                 return (
                   <>
@@ -1658,10 +2197,7 @@ export default function App() {
                       <>
                         <div style={{ padding: '12px 16px 4px', fontSize: 11, fontWeight: 700, color: '#8b5cf6', textTransform: 'uppercase', letterSpacing: 0.8 }}>My Foods</div>
                         {filteredCustom.map(food => (
-                          <FoodItem key={food.id} product={{
-                            code: food.id, product_name: food.name, brands: food.brand,
-                            nutriments: { 'energy-kcal_100g': food.caloriesPer100, proteins_100g: food.proteinPer100, carbohydrates_100g: food.carbsPer100, fat_100g: food.fatPer100, fiber_100g: food.fibrePer100, sugars_100g: food.sugarPer100 },
-                          }} onAdd={() => setPortionFood(food)} onDelete={() => deleteCustomFood(food.id)} />
+                          <FoodItem key={food.id} product={toFoodItemProduct(food)} onAdd={() => setPortionFood(food)} onEdit={() => { setEditingCustomFood(food); setShowCustomFoodModal(true); }} onDelete={() => deleteCustomFood(food.id)} />
                         ))}
                       </>
                     )}
@@ -1669,10 +2205,7 @@ export default function App() {
                       <>
                         <div style={{ padding: '12px 16px 4px', fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.8 }}>Recent</div>
                         {recentFoods.map((food, i) => (
-                          <FoodItem key={food.id || i} product={{
-                            code: food.id, product_name: food.name, brands: food.brand,
-                            nutriments: { 'energy-kcal_100g': food.caloriesPer100, proteins_100g: food.proteinPer100, carbohydrates_100g: food.carbsPer100, fat_100g: food.fatPer100 },
-                          }} onAdd={f => setPortionFood(f)} />
+                          <FoodItem key={food.id || i} product={toFoodItemProduct(food)} onAdd={f => setPortionFood(f)} />
                         ))}
                       </>
                     )}
@@ -1686,22 +2219,22 @@ export default function App() {
                   </>
                 );
               })()}
-              {/* Custom food matches in search results */}
-              {searchQuery.length >= 2 && (() => {
-                const q = searchQuery.toLowerCase();
-                const matches = customFoods.filter(f => f.name.toLowerCase().includes(q) || (f.brand || '').toLowerCase().includes(q));
-                return matches.length > 0 ? (
-                  <>
-                    <div style={{ padding: '12px 16px 4px', fontSize: 11, fontWeight: 700, color: '#8b5cf6', textTransform: 'uppercase', letterSpacing: 0.8 }}>My Foods</div>
-                    {matches.map(food => (
-                      <FoodItem key={food.id} product={{
-                        code: food.id, product_name: food.name, brands: food.brand,
-                        nutriments: { 'energy-kcal_100g': food.caloriesPer100, proteins_100g: food.proteinPer100, carbohydrates_100g: food.carbsPer100, fat_100g: food.fatPer100 },
-                      }} onAdd={() => setPortionFood(food)} onDelete={() => deleteCustomFood(food.id)} />
-                    ))}
-                  </>
-                ) : null;
-              })()}
+              {hasActiveSearchQuery && matchedCustomFoods.length > 0 && (
+                <>
+                  <div style={{ padding: '12px 16px 4px', fontSize: 11, fontWeight: 700, color: '#8b5cf6', textTransform: 'uppercase', letterSpacing: 0.8 }}>My Foods</div>
+                  {matchedCustomFoods.map(food => (
+                    <FoodItem key={food.id} product={toFoodItemProduct(food)} onAdd={() => setPortionFood(food)} onEdit={() => { setEditingCustomFood(food); setShowCustomFoodModal(true); }} onDelete={() => deleteCustomFood(food.id)} />
+                  ))}
+                </>
+              )}
+              {hasActiveSearchQuery && matchedRecentFoods.length > 0 && (
+                <>
+                  <div style={{ padding: '12px 16px 4px', fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.8 }}>Recent</div>
+                  {matchedRecentFoods.map((food, i) => (
+                    <FoodItem key={food.id || i} product={toFoodItemProduct(food)} onAdd={f => setPortionFood(f)} />
+                  ))}
+                </>
+              )}
               {searchResults.map((p, i) => (
                 <FoodItem key={p.code || i} product={p} onAdd={food => setPortionFood(food)} />
               ))}
@@ -2231,9 +2764,28 @@ export default function App() {
       {/* ── Modals ── */}
       {portionFood && <PortionModal food={portionFood} meal={searchMeal} onConfirm={addFoodEntry} onClose={() => setPortionFood(null)} />}
       {quickAddMeal && <QuickAddModal meal={quickAddMeal} onConfirm={entry => { addFoodEntry(entry); setQuickAddMeal(null); }} onClose={() => setQuickAddMeal(null)} />}
+      {editingFoodEntry && editingFoodEntry.caloriesPer100 && (
+        <PortionModal
+          food={editingFoodEntry}
+          meal={editingFoodTarget.meal}
+          initialGrams={editingFoodEntry.grams}
+          confirmLabel="Save changes"
+          onConfirm={entry => updateFoodEntry(editingFoodTarget.meal, editingFoodTarget.index, entry)}
+          onClose={() => setEditingFoodTarget(null)}
+        />
+      )}
+      {editingFoodEntry && !editingFoodEntry.caloriesPer100 && (
+        <QuickAddModal
+          meal={editingFoodTarget.meal}
+          initialEntry={editingFoodEntry}
+          submitLabel="Save changes"
+          onConfirm={entry => updateFoodEntry(editingFoodTarget.meal, editingFoodTarget.index, entry)}
+          onClose={() => setEditingFoodTarget(null)}
+        />
+      )}
       {showScanner && <BarcodeScanner onDetect={handleBarcode} onClose={() => setShowScanner(false)} />}
       {showExerciseModal && <ExerciseModal onConfirm={addExercise} onClose={() => setShowExerciseModal(false)} />}
-      {showCustomFoodModal && <CustomFoodModal onSave={saveCustomFood} onClose={() => setShowCustomFoodModal(false)} />}
+      {showCustomFoodModal && <CustomFoodModal food={editingCustomFood} onSave={saveCustomFood} onClose={closeCustomFoodModal} />}
       {saveMealTarget && <SaveMealModal mealLabel={saveMealTarget.label} onSave={name => saveMealTemplate(saveMealTarget.meal, name)} onClose={() => setSaveMealTarget(null)} />}
       {loadMealTarget && <SavedMealsModal savedMeals={savedMeals} onLoad={loadMealTemplate} onDelete={deleteMealTemplate} onClose={() => setLoadMealTarget(null)} />}
       {showAuthModal && <AuthModal currentUser={currentUser} onSuccess={handleAuthSuccess} onClose={() => setShowAuthModal(false)} />}
