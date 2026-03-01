@@ -9,6 +9,13 @@ export default defineConfig({
       // Production hosting must set this separately if popup auth is used there.
       'Cross-Origin-Opener-Policy': 'same-origin-allow-popups',
     },
+    proxy: {
+      '/api/openfoodfacts': {
+        target: 'https://world.openfoodfacts.net',
+        changeOrigin: true,
+        rewrite: path => path.replace(/^\/api\/openfoodfacts/, ''),
+      },
+    },
   },
   plugins: [
     react(),
@@ -66,7 +73,7 @@ export default defineConfig({
           },
           {
             // Cache Open Food Facts search results for 24h.
-            urlPattern: /^https:\/\/.*openfoodfacts\.org\/.*/i,
+            urlPattern: /^https:\/\/.*openfoodfacts\.(org|net)\/.*/i,
             handler: 'StaleWhileRevalidate',
             options: {
               cacheName: 'openfoodfacts-cache',

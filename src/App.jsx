@@ -29,6 +29,7 @@ const SEARCH_RESULT_LIMIT = 12;
 const LOCAL_SEARCH_RESULT_LIMIT = 6;
 const SEARCH_MIN_STRONG_MATCHES = 5;
 const SEARCH_STRONG_MATCH_THRESHOLD = 140;
+const OPEN_FOOD_FACTS_ORIGIN = import.meta.env.DEV ? '/api/openfoodfacts' : 'https://world.openfoodfacts.net';
 
 /* ─── Small UI components ────────────────────────────────────────────────── */
 
@@ -365,6 +366,12 @@ function toRecentFoodRecord(food) {
   if (food.suggestedServingGrams !== undefined) record.suggestedServingGrams = food.suggestedServingGrams;
 
   return record;
+}
+
+async function fetchOpenFoodFactsJson(path, options = {}) {
+  const response = await fetch(`${OPEN_FOOD_FACTS_ORIGIN}${path}`, options);
+  if (!response.ok) throw new Error(`Open Food Facts request failed (${response.status})`);
+  return response.json();
 }
 
 function getMatchingLocalFoods(foods, query, excludeIds = new Set(), limit = LOCAL_SEARCH_RESULT_LIMIT) {
@@ -1592,8 +1599,7 @@ export default function App() {
     setShowScanner(false);
     setBarcodeLoading(true);
     try {
-      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${code}.json`);
-      const data = await res.json();
+      const data = await fetchOpenFoodFactsJson(`/api/v0/product/${code}.json`);
       if (data.status === 1 && data.product) {
         const p = data.product;
         const food = mapProductToFood({ ...p, code });
@@ -1689,6 +1695,7 @@ export default function App() {
     if (prefixCacheEntry) {
       setSearchResults(rankSearchItems(prefixCacheEntry.results, normalizedQuery, SEARCH_RESULT_LIMIT));
     }
+    const hadPrefilledResults = Boolean(prefixCacheEntry);
 
     // Cancel any in-flight request
     if (searchAbort.current) searchAbort.current.abort();
@@ -1697,22 +1704,31 @@ export default function App() {
 
     setSearching(true);
     try {
-      const base = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(normalizedQuery)}&json=1&page_size=${SEARCH_REMOTE_PAGE_SIZE}&fields=code,product_name,brands,nutriments,serving_size,serving_quantity,serving_quantity_unit,countries_tags`;
+      const base = `/cgi/search.pl?search_terms=${encodeURIComponent(normalizedQuery)}&json=1&page_size=${SEARCH_REMOTE_PAGE_SIZE}&fields=code,product_name,brands,nutriments,serving_size,serving_quantity,serving_quantity_unit,countries_tags`;
       const filterValid = p => p.product_name && p.nutriments && (p.nutriments['energy-kcal_100g'] || p.nutriments['energy-kcal']);
+      let ukResults = [];
+      let mergedResults = [];
+      let shouldFetchWorld = true;
 
-      // Try UK-filtered first
-      const ukRes = await fetch(`${base}&tagtype_0=countries&tag_contains_0=contains&tag_0=en:united-kingdom`, { signal: controller.signal });
-      const ukData = await ukRes.json();
-      const ukResults = (ukData.products || []).filter(filterValid);
-      const strongUkMatches = countStrongSearchMatches(ukResults, normalizedQuery);
-      let mergedResults = ukResults;
+      try {
+        const ukData = await fetchOpenFoodFactsJson(`${base}&tagtype_0=countries&tag_contains_0=contains&tag_0=en:united-kingdom`, { signal: controller.signal });
+        ukResults = (ukData.products || []).filter(filterValid);
+        const strongUkMatches = countStrongSearchMatches(ukResults, normalizedQuery);
+        mergedResults = ukResults;
+        shouldFetchWorld = ukResults.length < SEARCH_MIN_STRONG_MATCHES || strongUkMatches < SEARCH_MIN_STRONG_MATCHES;
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+      }
 
-      // Broaden results if UK matches are thin or weak.
-      if (ukResults.length < SEARCH_MIN_STRONG_MATCHES || strongUkMatches < SEARCH_MIN_STRONG_MATCHES) {
-        const worldRes = await fetch(base, { signal: controller.signal });
-        const worldData = await worldRes.json();
-        const worldResults = (worldData.products || []).filter(filterValid);
-        mergedResults = mergeUniqueSearchItems(ukResults, worldResults);
+      if (shouldFetchWorld) {
+        try {
+          const worldData = await fetchOpenFoodFactsJson(base, { signal: controller.signal });
+          const worldResults = (worldData.products || []).filter(filterValid);
+          mergedResults = mergeUniqueSearchItems(ukResults, worldResults);
+        } catch (e) {
+          if (e.name === 'AbortError') throw e;
+          if (ukResults.length === 0) throw e;
+        }
       }
 
       const rankedResults = rankSearchItems(mergedResults, normalizedQuery, SEARCH_CACHE_MAX_ENTRIES);
@@ -1726,7 +1742,7 @@ export default function App() {
         setSearchResults(visibleResults);
       }
     } catch (e) {
-      if (e.name !== 'AbortError' && searchAbort.current === controller) setSearchResults([]);
+      if (e.name !== 'AbortError' && searchAbort.current === controller && !hadPrefilledResults) setSearchResults([]);
     } finally {
       if (searchAbort.current === controller) {
         searchAbort.current = null;
